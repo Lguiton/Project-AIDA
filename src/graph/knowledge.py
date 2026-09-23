@@ -45,4 +45,4 @@ async def knowledge_specialist_node(state: AidaState, llm) -> dict:
         "messages": messages
     })
     
-    return {"messages": [response], "current_specialist": "knowledge"}
+    return {"messages": [response], "current_specialist": "knowledge", "ticket_status": "resolved"}

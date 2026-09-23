@@ -17,8 +17,10 @@ async def triage_router_node(state: AidaState, llm) -> dict:
         "ROUTING RULES:\n"
         "1. 'knowledge' -> Use this IF the issue contains specific error codes (e.g., Error 412, BSOD, SYSTEM_SERVICE_EXCEPTION) or asks about past/historical issues.\n"
         "2. 'remediate' -> Use this IF the user explicitly requests an action, fix, or remediation (e.g., 'flush my DNS', 'reset the password').\n"
-        "3. 'network' -> Use this IF the issue is strictly about live connectivity, cannot reach a website, or internet outages.\n"
-        "4. 'human_escalation' -> Use this if the issue is completely unrelated to IT.\n\n"
+        "3. 'network' -> Use this IF the issue is strictly about live connectivity, cannot reach a website, DNS lookups, or internet outages.\n"
+        "4. 'os_diag' -> Use this IF the machine is slow, freezing, running out of memory or disk space, or a process is using too much CPU.\n"
+        "5. 'security' -> Use this IF the user reports suspicious activity, unknown logins, possible malware, or asks which ports/services are exposed.\n"
+        "6. 'human_escalation' -> Use this if the issue is completely unrelated to IT.\n\n"
         "Failure to route correctly will break the system. Route based strictly on the rules above."
     )
     

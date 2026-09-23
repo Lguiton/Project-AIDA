@@ -12,4 +12,6 @@ async def network_specialist_node(state: AidaState, llm, tools) -> dict:
     # Bind the dynamically injected tools
     agent_llm = llm.bind_tools(tools)
     response = await (prompt | agent_llm).ainvoke({"messages": messages})
-    return {"messages": [response], "current_specialist": "network"}
+    # A reply with no pending tool calls is the specialist's final answer
+    status = "in_progress" if getattr(response, "tool_calls", None) else "resolved"
+    return {"messages": [response], "current_specialist": "network", "ticket_status": status}

@@ -35,12 +35,17 @@ async def lifespan(app: FastAPI):
     print(f"[System] Fetched {len(tools)} tools via MCP: {[t.name for t in tools]}")
     
     # 3. Route tools to the correct agents
-    net_tools = [t for t in tools if t.name == "ping_host"]
-    rem_tools = [t for t in tools if t.name == "flush_dns_cache"]
+    def pick(*names):
+        return [t for t in tools if t.name in names]
+
+    net_tools = pick("ping_host", "resolve_dns", "get_adapter_status")
+    rem_tools = pick("flush_dns_cache")
+    os_tools = pick("get_system_info", "check_disk_usage", "list_top_processes")
+    sec_tools = pick("list_listening_ports", "list_recent_logins")
     
     # 4. Compile the graph with injected tools
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
-    aida_graph = compile_aida_graph(llm, net_tools, rem_tools)
+    aida_graph = compile_aida_graph(llm, net_tools, rem_tools, os_tools, sec_tools)
     
     print("[System] Project AIDA API Ready.")
     

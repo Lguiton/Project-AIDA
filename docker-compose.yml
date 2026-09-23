@@ -1,0 +1,14 @@
+services:
+  pgvector:
+    image: ankane/pgvector:latest
+    environment:
+      POSTGRES_USER: aida
+      POSTGRES_PASSWORD: aida_password
+      POSTGRES_DB: aida_kb
+    ports:
+      - "55432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

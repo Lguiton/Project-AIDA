@@ -64,15 +64,20 @@ def submit_ticket(issue_text):
     return False
 
 
-def approve_ticket(thread_id):
+def decide_ticket(thread_id, approved):
+    """Send the operator's decision on a pending remediation (approve runs it, deny closes the ticket)."""
+    action = "Approval" if approved else "Denial"
     try:
-        response = requests.post(f"{API_URL}/{thread_id}/approve", json={"approved": True}, timeout=300)
+        response = requests.post(f"{API_URL}/{thread_id}/approve", json={"approved": approved}, timeout=300)
         if response.status_code == 200:
-            st.success(f"Ticket {thread_id[:8]} approved and executed.")
+            if approved:
+                st.success(f"Ticket {thread_id[:8]} approved and executed.")
+            else:
+                st.info(f"Ticket {thread_id[:8]} denied. No action was taken.")
         else:
-            st.error(f"Approval failed ({response.status_code}): {response.text}")
+            st.error(f"{action} failed ({response.status_code}): {response.text}")
     except Exception as e:
-        st.error(f"Approval failed: {e}")
+        st.error(f"{action} failed: {e}")
 
 
 # --- UI Layout ---
@@ -111,7 +116,7 @@ with right_pane:
             thread_id = ticket["thread_id"]
             created = format_timestamp(ticket.get("created_at"))
             specialist = (ticket.get("current_specialist") or "unknown").upper()
-            is_open = ticket.get("status") != "resolved" or ticket.get("requires_approval")
+            is_open = ticket.get("status") not in ("resolved", "denied") or ticket.get("requires_approval")
             with st.expander(f"Ticket {thread_id[:8]} - Specialist: {specialist} - {created}", expanded=bool(is_open)):
                 st.markdown(f"**Issue:** {ticket.get('issue')}")
                 st.markdown(f"**Status:** `{ticket.get('status')}`")
@@ -120,8 +125,13 @@ with right_pane:
                 # Human-in-the-Loop Gateway
                 if ticket.get("requires_approval"):
                     st.warning("⚠️ SECURITY GATEWAY: Agent is requesting permission to execute a destructive tool.")
-                    if st.button("Approve Remediation", key=f"btn_{thread_id}", type="primary"):
-                        approve_ticket(thread_id)
+                    approve_col, deny_col, _ = st.columns([1, 1, 2])
+                    if approve_col.button("Approve Remediation", key=f"approve_{thread_id}", type="primary"):
+                        decide_ticket(thread_id, approved=True)
+                        time.sleep(1)
+                        st.rerun()
+                    if deny_col.button("Deny", key=f"deny_{thread_id}"):
+                        decide_ticket(thread_id, approved=False)
                         time.sleep(1)
                         st.rerun()
 
@@ -136,7 +146,10 @@ with kpi_area:
         col4.metric("Pending Approvals", "—")
     else:
         col1.metric("AI Agents", str(metrics["agent_count"]), "Online", help=", ".join(metrics["agents"]))
-        col2.metric("Tickets", str(metrics["tickets_total"]), f"{metrics['tickets_resolved']} resolved", delta_color="off")
+        tickets_delta = f"{metrics['tickets_resolved']} resolved"
+        if metrics.get("tickets_denied"):
+            tickets_delta += f", {metrics['tickets_denied']} denied"
+        col2.metric("Tickets", str(metrics["tickets_total"]), tickets_delta, delta_color="off")
         if metrics["kb_online"]:
             col3.metric("Vector DB", "Online", f"{metrics['kb_records']} Records")
         else:

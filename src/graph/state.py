@@ -24,4 +24,4 @@ class AidaState(TypedDict):
     human_approval_status: Literal["pending", "approved", "rejected", "none"]
     
     # Overwritten on update: Global lifecycle of the user's issue
-    ticket_status: Literal["open", "in_progress", "resolved", "escalated"]
+    ticket_status: Literal["open", "in_progress", "resolved", "escalated", "denied"]

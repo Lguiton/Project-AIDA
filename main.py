@@ -11,7 +11,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
@@ -220,8 +220,23 @@ async def approve_remediation(thread_id: str, request: ApprovalRequest):
             pass
         ticket = await snapshot_ticket(thread_id)
         return {"message": "Remediation approved and executed.", **ticket}
-    else:
-        return {"message": "Remediation denied. Ticket paused."}
+    # Denied: answer each pending tool call with a refusal so nothing runs, then close the ticket
+    pending_calls = getattr(state.values["messages"][-1], "tool_calls", None) or []
+    refusals = [
+        ToolMessage(content="Denied by operator. The action was not executed.",
+                    tool_call_id=tc["id"], name=tc["name"])
+        for tc in pending_calls
+    ]
+    names = ", ".join(f"`{tc['name']}`" for tc in pending_calls) or "The requested action"
+    summary = AIMessage(content=f"Remediation denied by operator: {names} was not run. No changes were made to the system.")
+    # Recorded as the remediate node's output; its last message has no tool calls, so the graph ends here
+    await aida_graph.aupdate_state(
+        config,
+        {"messages": refusals + [summary], "ticket_status": "denied"},
+        as_node="remediate",
+    )
+    ticket = await snapshot_ticket(thread_id)
+    return {"message": "Remediation denied. No action was taken.", **ticket}
 
 
 @app.get("/api/metrics")
@@ -232,7 +247,8 @@ async def metrics():
             """
             SELECT count(*) AS tickets_total,
                    count(*) FILTER (WHERE requires_approval) AS pending_approvals,
-                   count(*) FILTER (WHERE status = 'resolved') AS tickets_resolved
+                   count(*) FILTER (WHERE status = 'resolved') AS tickets_resolved,
+                   count(*) FILTER (WHERE status = 'denied') AS tickets_denied
             FROM aida_tickets
             """
         )).fetchone()

@@ -279,12 +279,69 @@ def list_recent_logins(limit: int = 10) -> str:
 # Remediation tools (destructive — gated by human approval in the graph)
 # ---------------------------------------------------------------------------
 
+def _run_status(cmd: list[str], timeout: int = 10) -> tuple[bool, str]:
+    """Run a command; return (succeeded, combined output)."""
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        output = "\n".join(x.strip() for x in (result.stdout, result.stderr) if x and x.strip())
+        return result.returncode == 0, output.replace("\r", "")
+    except FileNotFoundError:
+        return False, f"{cmd[0]} not found"
+    except subprocess.TimeoutExpired:
+        return False, f"timed out after {timeout} seconds"
+    except Exception as e:
+        return False, str(e)
+
+
+def _find_windows_ipconfig() -> str | None:
+    """ipconfig.exe is reachable from WSL through Windows interop."""
+    found = shutil.which("ipconfig.exe")
+    if found:
+        return found
+    default = "/mnt/c/Windows/System32/ipconfig.exe"
+    return default if os.path.exists(default) else None
+
+
 @mcp.tool()
 def flush_dns_cache() -> str:
     """
-    Executes a DNS cache flush on the host system. Requires administrative clearance.
+    Flushes the DNS caches on this machine: the Linux/WSL resolver cache (systemd-resolved) and,
+    when running under WSL, the Windows DNS client cache. Changes system state, so it only runs
+    after a human approves it. Reports exactly which caches were flushed and which were not.
     """
-    return "SUCCESS: DNS resolver cache flushed via MCP execution layer."
+    results = []
+
+    # 1. Linux / WSL: systemd-resolved
+    if shutil.which("resolvectl"):
+        ok, output = _run_status(["resolvectl", "flush-caches"])
+        if not ok:
+            # Needs root on most systems; try sudo without prompting for a password
+            ok, sudo_output = _run_status(["sudo", "-n", "resolvectl", "flush-caches"])
+            if ok:
+                output = sudo_output or "flushed with sudo"
+            else:
+                output = (f"{output or 'permission denied'}; sudo without password not allowed "
+                          f"({sudo_output or 'no output'}). To allow it, add this sudoers rule with 'sudo visudo': "
+                          f"<your-user> ALL=(root) NOPASSWD: /usr/bin/resolvectl flush-caches")
+        results.append(("Linux resolver cache (systemd-resolved)", ok, output))
+    else:
+        results.append(("Linux resolver cache (systemd-resolved)", False,
+                        "resolvectl not found (systemd-resolved not in use); nothing to flush"))
+
+    # 2. Windows DNS client cache (only when running under WSL)
+    ipconfig = _find_windows_ipconfig()
+    if ipconfig:
+        ok, output = _run_status([ipconfig, "/flushdns"])
+        results.append(("Windows DNS client cache (ipconfig /flushdns)", ok, output))
+
+    flushed = [name for name, ok, _ in results if ok]
+    lines = [f"{'FLUSHED' if ok else 'NOT FLUSHED'}: {name}" + (f" -- {detail}" if detail else "")
+             for name, ok, detail in results]
+    if flushed:
+        header = f"SUCCESS: flushed {len(flushed)} of {len(results)} DNS cache(s)."
+    else:
+        header = "FAILED: no DNS cache was flushed."
+    return header + "\n" + "\n".join(lines)
 
 
 if __name__ == "__main__":

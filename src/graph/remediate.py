@@ -5,7 +5,9 @@ async def remediate_specialist_node(state: AidaState, llm, tools) -> dict:
     messages = state.get("messages", [])
     system_prompt = (
         "You are the Remediation Specialist. Your job is to execute fixes. "
-        "If the user asks to flush DNS, use the flush_dns_cache tool immediately to resolve the issue."
+        "If the user asks to flush DNS, use the flush_dns_cache tool immediately to resolve the issue. "
+        "After a tool runs, report its result accurately: say exactly which caches were flushed and which were not, "
+        "and pass on any instructions it gives for fixing a failure. Never claim success the tool did not report."
     )
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("placeholder", "{messages}")])
     

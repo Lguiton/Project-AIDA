@@ -25,6 +25,7 @@ TEST_DB_URI = BASE_DB_URI.rsplit("/", 1)[0] + "/" + TEST_DB_NAME
 os.environ["AIDA_DB_URI"] = TEST_DB_URI
 os.environ["AIDA_API_KEY"] = "test-api-key"
 os.environ["AIDA_UI_PASSWORD"] = "test-password"
+os.environ["AIDA_MONITOR_INTERVAL"] = "0"  # tests trigger monitoring runs explicitly
 os.environ.setdefault("OPENAI_API_KEY", "not-used-in-tests")
 
 
@@ -51,6 +52,7 @@ def test_db():
     import psycopg
     with psycopg.connect(TEST_DB_URI, autocommit=True) as conn:
         conn.execute("DROP TABLE IF EXISTS aida_tickets")
+        conn.execute("DROP TABLE IF EXISTS aida_audit")
     return TEST_DB_URI
 
 

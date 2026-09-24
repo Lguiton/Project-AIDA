@@ -96,3 +96,44 @@ def test_flush_dns_reports_each_cache(monkeypatch, tmp_path):
     assert "NOT FLUSHED: Linux resolver cache" in result
     assert "sudoers rule" in result
     assert "FLUSHED: Windows DNS client cache" in result
+
+
+def test_sshd_settings_use_first_value_and_includes(tmp_path):
+    conf_d = tmp_path / "sshd_config.d"
+    conf_d.mkdir()
+    (conf_d / "50-cloud.conf").write_text("PasswordAuthentication no\n")
+    main = tmp_path / "sshd_config"
+    main.write_text(f"Include {conf_d}/*.conf\n# comment\nPermitRootLogin yes\nPasswordAuthentication yes\n"
+                    "Match User bob\n  PermitRootLogin no\n")
+    settings = mcp_server._sshd_settings(str(main))
+    assert settings["passwordauthentication"] == "no"   # first value wins (from the include)
+    assert settings["permitrootlogin"] == "yes"          # Match block ignored
+
+
+def test_security_score_and_report_format(monkeypatch):
+    findings = [
+        {"severity": "critical", "title": "a", "detail": "", "fix": "x"},
+        {"severity": "medium", "title": "b", "detail": "", "fix": ""},
+        {"severity": "info", "title": "c", "detail": "", "fix": ""},
+    ]
+    assert mcp_server.security_score(findings) == 100 - 30 - 7
+    monkeypatch.setattr(mcp_server, "run_security_checks", lambda: findings)
+    report = mcp_server.security_audit()
+    assert report.startswith("SECURITY SCORE: 63/100 (2 issue(s) found)")
+    assert report.index("[CRITICAL]") < report.index("[MEDIUM]") < report.index("[INFO]")
+
+
+def test_security_checks_run_on_this_machine():
+    findings = mcp_server.run_security_checks()
+    assert findings and all(f["severity"] in mcp_server.SEVERITY_PENALTY for f in findings)
+
+
+def test_failed_logins_are_counted_per_ip(monkeypatch):
+    log = ("sshd[1]: Failed password for root from 203.0.113.9 port 22 ssh2\n"
+           "sshd[2]: Invalid user admin from 203.0.113.9 port 22\n"
+           "sshd[3]: Failed password for bob from 198.51.100.4 port 22 ssh2\n")
+    monkeypatch.setattr(mcp_server, "_run_status", lambda *a, **k: (True, log))
+    counts, source = mcp_server._failed_logins(24)
+    assert counts == {"203.0.113.9": 2, "198.51.100.4": 1}
+    report = mcp_server.list_failed_logins(24)
+    assert "3 failed login attempt(s)" in report and "203.0.113.9: 2" in report

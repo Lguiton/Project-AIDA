@@ -8,6 +8,9 @@ Autonomous IT Operations Help Desk by Eivanta Labs. Describe an IT problem in th
 - **API** (`main.py`, FastAPI on port 8006): runs the LangGraph workflow; every `/api` call needs the `X-AIDA-Key` header.
 - **Agents** (`src/graph/`): a triage router plus network, OS diagnostics, security, remediation and knowledge-base specialists.
 - **Tools** (`mcp_server.py`, MCP): read-only diagnostics run freely; `flush_dns_cache`, `restart_service` (allowlisted services only) and `clear_temp_files` run only after approval.
+- **Proactive monitoring** (`src/monitor.py`): checks disk, memory, load, failed services and TLS certificates on a schedule and opens its own tickets (one per problem).
+- **Security health check**: a scored, read-only audit (admin accounts, exposed services, SSH hardening, firewall, pending security updates, secrets-file permissions, suspicious setuid programs, failed logins).
+- **Audit log** (`src/audit.py`): every ticket, approval, denial, executed fix and knowledge change, hash-chained and append-only so tampering is detectable.
 - **Memory** (Postgres + pgvector via `docker-compose.yml`): tickets and agent history survive restarts; resolved tickets are added to the knowledge base so similar issues are answered from history.
 
 ## Setup

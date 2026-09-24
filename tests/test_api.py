@@ -176,3 +176,11 @@ def test_startup_repairs_tickets_learned_without_a_fix(api_client):
     assert after == before - 1
     assert ticket["status"] == "needs_info"
     assert ticket["learned"] is False and ticket["forgotten"] is True
+
+
+def test_security_reports_are_not_learned(api_client):
+    with api_client() as client:
+        report = create(client, "run a security health check")
+    assert report["current_specialist"] == "security"
+    assert "SECURITY SCORE" in report["last_message"]
+    assert report["status"] == "resolved" and report["learned"] is False

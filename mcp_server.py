@@ -6,6 +6,8 @@ import time
 import shutil
 import stat as _stat
 import socket
+import glob
+from collections import Counter
 import subprocess
 import tempfile
 
@@ -255,16 +257,11 @@ def _describe_bind_address(address: str) -> str:
     return f"specific address {host}"
 
 
-@mcp.tool()
-def list_listening_ports() -> str:
-    """
-    Lists TCP and UDP ports the host is listening on, whether each is exposed to other machines
-    or bound to localhost only, and the owning process when visible.
-    """
+def _listening_sockets() -> list[tuple[int, str, str, str]] | str:
+    """(port, proto, where, process) for every listening socket, or an error string."""
     raw = _run(["ss", "-tulnpH"])
     if raw.startswith(("Command", "Timeout", "Execution Error")):
         return raw
-
     entries = set()
     for line in raw.splitlines():
         parts = line.split()
@@ -275,11 +272,22 @@ def list_listening_ports() -> str:
         match = re.search(r'users:\(\("([^"]+)"', line)
         process = match.group(1) if match else "unknown (owned by another user)"
         entries.add((int(port) if port.isdigit() else 0, proto, _describe_bind_address(address), process))
+    return sorted(entries)
 
+
+@mcp.tool()
+def list_listening_ports() -> str:
+    """
+    Lists TCP and UDP ports the host is listening on, whether each is exposed to other machines
+    or bound to localhost only, and the owning process when visible.
+    """
+    entries = _listening_sockets()
+    if isinstance(entries, str):
+        return entries
     if not entries:
         return "No listening ports found."
     lines = ["PROTO  PORT   PROCESS                          LISTENING ON"]
-    for port, proto, where, process in sorted(entries):
+    for port, proto, where, process in entries:
         lines.append(f"{proto:<6} {port:<6} {process:<32} {where}")
     return "\n".join(lines)
 
@@ -291,6 +299,232 @@ def list_recent_logins(limit: int = 10) -> str:
     """
     limit = max(1, min(int(limit), 50))
     return _run(["last", "-n", str(limit)])
+
+
+# ---------------------------------------------------------------------------
+# Security health check and attack monitoring (read-only)
+# ---------------------------------------------------------------------------
+
+SEVERITY_PENALTY = {"critical": 30, "high": 15, "medium": 7, "low": 3, "info": 0}
+SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+_FAILED_LOGIN = re.compile(r"(Failed password|Invalid user|authentication failure).*?(?:from|rhost=)\s*([0-9a-fA-F:.]+)")
+
+
+def _sshd_settings(config_path: str = "/etc/ssh/sshd_config") -> dict[str, str] | None:
+    """Effective sshd settings. sshd uses the FIRST value it sees; Include files are read where included."""
+    if not os.path.exists(config_path):
+        return None
+    settings: dict[str, str] = {}
+
+    def read(path: str):
+        try:
+            with open(path) as f:
+                lines = f.readlines()
+        except OSError:
+            return
+        for line in lines:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            key, _, value = line.partition(" ")
+            key, value = key.lower(), value.strip()
+            if key == "include":
+                for pattern in value.split():
+                    if not os.path.isabs(pattern):
+                        pattern = os.path.join(os.path.dirname(config_path), pattern)
+                    for included in sorted(glob.glob(pattern)):
+                        read(included)
+            elif key == "match":
+                return  # settings after a Match block are conditional; stop at the global section
+            else:
+                settings.setdefault(key, value.lower())
+
+    read(config_path)
+    return settings
+
+
+def _failed_logins(hours: int = 24) -> tuple[Counter, str]:
+    """Count failed SSH/login attempts per source IP. Returns (counter, where the data came from)."""
+    text, source = "", ""
+    ok, output = _run_status(["journalctl", "--since", f"{hours} hours ago", "--no-pager", "-q",
+                              "-t", "sshd", "-t", "sshd-session", "-t", "sudo", "-t", "login"], timeout=15)
+    if ok:
+        text, source = output, "system journal"
+    else:
+        for path in ("/var/log/auth.log", "/var/log/secure"):
+            try:
+                with open(path, errors="replace") as f:
+                    text, source = f.read()[-2_000_000:], path
+                break
+            except OSError:
+                continue
+    if not source:
+        return Counter(), "no readable login log (needs journal access or /var/log/auth.log)"
+    counts = Counter(match.group(2) for match in _FAILED_LOGIN.finditer(text))
+    return counts, source
+
+
+def _suid_in_unusual_places(roots=("/tmp", "/var/tmp", "/dev/shm", "/home", "/opt", "/usr/local"),
+                            time_budget: float = 5.0) -> list[str]:
+    """Programs that run as their owner (setuid) in places where they normally should not exist."""
+    found, deadline = [], time.time() + time_budget
+    for root in roots:
+        for dirpath, _dirs, files in os.walk(root, followlinks=False):
+            if time.time() > deadline:
+                return found
+            for name in files:
+                path = os.path.join(dirpath, name)
+                try:
+                    st = os.lstat(path)
+                except OSError:
+                    continue
+                if _stat.S_ISREG(st.st_mode) and st.st_mode & _stat.S_ISUID:
+                    found.append(path)
+    return found
+
+
+def run_security_checks(sshd_config: str = "/etc/ssh/sshd_config", env_file: str | None = None) -> list[dict]:
+    """All security checks as a list of findings: {severity, title, detail, fix}."""
+    findings: list[dict] = []
+
+    def add(severity, title, detail, fix=""):
+        findings.append({"severity": severity, "title": title, "detail": detail, "fix": fix})
+
+    # 1. Admin accounts: any UID 0 account other than root is a classic backdoor
+    try:
+        with open("/etc/passwd") as f:
+            uid0 = [line.split(":")[0] for line in f if line.count(":") >= 6 and line.split(":")[2] == "0"]
+        extra = [u for u in uid0 if u != "root"]
+        if extra:
+            add("critical", "Extra accounts with full admin rights (UID 0)", ", ".join(extra),
+                "Remove or re-number these accounts unless you created them on purpose.")
+        else:
+            add("info", "Only root has UID 0", "No hidden admin accounts found.")
+    except OSError:
+        add("low", "Could not read /etc/passwd", "Account check skipped.")
+
+    # 2. Exposed services
+    sockets = _listening_sockets()
+    exposed = [] if isinstance(sockets, str) else [s for s in sockets if "reachable from other machines" in s[2]]
+    ssh_exposed = any(port == 22 for port, *_ in exposed)
+    if exposed:
+        names = ", ".join(f"{proc} on {proto}/{port}" for port, proto, _where, proc in exposed[:10])
+        add("medium" if len(exposed) > 3 else "low", f"{len(exposed)} service(s) reachable from other machines",
+            names, "Bind services you only use locally to 127.0.0.1, or block them with a firewall.")
+    else:
+        add("info", "No services reachable from other machines", "Everything listens on localhost only.")
+
+    # 3. SSH configuration
+    settings = _sshd_settings(sshd_config)
+    if settings is None:
+        add("info", "SSH server not installed", "No sshd_config found.")
+    else:
+        root_login = settings.get("permitrootlogin", "prohibit-password")
+        password_auth = settings.get("passwordauthentication", "yes")
+        if root_login == "yes":
+            add("high" if ssh_exposed else "medium", "SSH allows root to log in with a password",
+                f"PermitRootLogin {root_login}", "Set 'PermitRootLogin no' in /etc/ssh/sshd_config.")
+        if password_auth == "yes":
+            add("high" if ssh_exposed else "low", "SSH accepts password logins",
+                "PasswordAuthentication yes" + (" and SSH is reachable from other machines" if ssh_exposed else ""),
+                "Use SSH keys and set 'PasswordAuthentication no'.")
+        if root_login != "yes" and password_auth != "yes":
+            add("info", "SSH configuration is hardened", f"PermitRootLogin {root_login}, PasswordAuthentication {password_auth}")
+
+    # 4. Firewall
+    ok, output = _run_status(["ufw", "status"], timeout=5)
+    if ok and "inactive" in output.lower():
+        add("medium" if exposed else "low", "Firewall (ufw) is inactive", "No host firewall rules are enforced.",
+            "Enable it with 'sudo ufw default deny incoming && sudo ufw enable' (allow the ports you need first). "
+            "On WSL, the Windows firewall still protects the machine.")
+    elif ok:
+        add("info", "Firewall (ufw) is active", output.splitlines()[0] if output else "active")
+    else:
+        add("low", "Firewall status unknown", "ufw is not installed or needs root to report its status.")
+
+    # 5. Pending updates
+    ok, output = _run_status(["apt", "list", "--upgradable"], timeout=30)
+    if ok:
+        upgradable = [l for l in output.splitlines() if "/" in l and "Listing" not in l]
+        security = [l.split("/")[0] for l in upgradable if "-security" in l]
+        if security:
+            add("high", f"{len(security)} security update(s) pending", ", ".join(security[:15]),
+                "Install with 'sudo apt update && sudo apt upgrade'.")
+        elif upgradable:
+            add("low", f"{len(upgradable)} non-security update(s) pending", ", ".join(l.split('/')[0] for l in upgradable[:10]),
+                "Install when convenient.")
+        else:
+            add("info", "System packages are up to date", "No pending updates (as of the last 'apt update').")
+    else:
+        add("info", "Package update check skipped", "apt is not available on this system.")
+
+    # 6. Secrets file permissions
+    env_path = env_file or os.path.join(os.getcwd(), ".env")
+    if os.path.exists(env_path):
+        mode = os.stat(env_path).st_mode
+        if mode & (_stat.S_IROTH | _stat.S_IWOTH):
+            on_windows_drive = env_path.startswith("/mnt/")
+            add("medium", "Secrets file is readable by other users", f"{env_path} has mode {oct(mode & 0o777)}"
+                + (" (files on the Windows drive show as world-readable in WSL)" if on_windows_drive else ""),
+                "Run 'chmod 600 .env'" + (" (needs the drive mounted with metadata in /etc/wsl.conf)" if on_windows_drive else "") + ".")
+        else:
+            add("info", "Secrets file permissions are private", f"{env_path} has mode {oct(mode & 0o777)}")
+
+    # 7. setuid programs in unusual places
+    suid = _suid_in_unusual_places()
+    if suid:
+        add("high", "Programs with elevated permissions in unusual folders", ", ".join(suid[:10]),
+            "Check where these came from; remove them if you don't recognise them.")
+
+    # 8. Failed logins
+    counts, source = _failed_logins(24)
+    total = sum(counts.values())
+    if total:
+        top = ", ".join(f"{ip} ({n})" for ip, n in counts.most_common(5))
+        add("high" if total >= 50 else "medium" if total >= 10 else "low",
+            f"{total} failed login attempt(s) in the last 24 hours", f"Top sources: {top}. Data from {source}.",
+            "Repeated failures from one address suggest password guessing; block it or restrict SSH.")
+    else:
+        add("info", "No failed login attempts in the last 24 hours", f"Data from {source}.")
+
+    findings.sort(key=lambda f: SEVERITY_ORDER.index(f["severity"]))
+    return findings
+
+
+def security_score(findings: list[dict]) -> int:
+    return max(0, 100 - sum(SEVERITY_PENALTY[f["severity"]] for f in findings))
+
+
+@mcp.tool()
+def security_audit() -> str:
+    """
+    Runs a read-only security health check of this machine: admin accounts, exposed services, SSH
+    hardening, firewall, pending security updates, secrets-file permissions, suspicious setuid programs
+    and failed login attempts. Returns a 0-100 score and findings ordered by severity, each with a fix.
+    """
+    findings = run_security_checks()
+    score = security_score(findings)
+    lines = [f"SECURITY SCORE: {score}/100 ({sum(f['severity'] != 'info' for f in findings)} issue(s) found)"]
+    for f in findings:
+        lines.append(f"[{f['severity'].upper()}] {f['title']}: {f['detail']}")
+        if f["fix"]:
+            lines.append(f"    Fix: {f['fix']}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def list_failed_logins(hours: int = 24) -> str:
+    """
+    Counts failed login attempts (SSH password guessing, invalid users, sudo failures) per source
+    IP address over the last N hours. Read-only.
+    """
+    hours = max(1, min(int(hours), 24 * 30))
+    counts, source = _failed_logins(hours)
+    if not counts:
+        return f"No failed login attempts found in the last {hours} hour(s). Data from {source}."
+    lines = [f"{sum(counts.values())} failed login attempt(s) in the last {hours} hour(s) (data from {source}):"]
+    lines += [f"  {ip}: {n}" for ip, n in counts.most_common(20)]
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

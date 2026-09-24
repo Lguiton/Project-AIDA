@@ -6,8 +6,11 @@ async def security_specialist_node(state: AidaState, llm, tools) -> dict:
     system_prompt = (
         "You are the Security Specialist. "
         "Investigate security concerns such as suspicious activity, unexpected open ports or services, "
-        "and unfamiliar logins. Use the provided read-only tools (listening ports, recent logins) to gather "
-        "real evidence from the host before drawing conclusions. "
+        "unfamiliar logins, password-guessing attacks, expiring certificates and system hardening. "
+        "Use the provided read-only tools to gather real evidence from the host before drawing conclusions: "
+        "security_audit for a full security health check (score plus findings by severity), list_failed_logins "
+        "for login attacks, list_listening_ports and list_recent_logins for details. "
+        "For a health check, report the score, then the findings from most to least severe, each with its fix. "
         "Report what you found, flag anything that looks unusual and explain why, and recommend next steps. "
         "If the evidence suggests an active compromise, say clearly that the ticket should be escalated to a human. "
         "Write every IP address, port and process name inside backticks, e.g. `0.0.0.0:8000`. "

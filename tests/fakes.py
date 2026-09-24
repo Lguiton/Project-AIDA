@@ -8,6 +8,8 @@ _ids = itertools.count()
 
 # (keyword in the user's issue) -> (specialist, tool to call or None)
 SCRIPT = [
+    ("health check", "security", "security_audit", {}),
+    ("disk", "os_diag", "check_disk_usage", {"path": "/"}),
     ("dns", "remediate", "flush_dns_cache", {}),
     ("temp", "remediate", "clear_temp_files", {"older_than_days": 1}),
     ("restart", "remediate", "restart_service", {"service_name": "definitely-not-allowed"}),

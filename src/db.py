@@ -29,4 +29,8 @@ TICKETS_TABLE_SQL = (
     "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS learned BOOLEAN NOT NULL DEFAULT FALSE",
     # Operator removed the ticket from the knowledge base; never re-learn it
     "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS forgotten BOOLEAN NOT NULL DEFAULT FALSE",
+    # Where the ticket came from ('user' or 'monitor') and, for monitoring tickets, which alert
+    "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'user'",
+    "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS alert_key TEXT",
+    "CREATE INDEX IF NOT EXISTS aida_tickets_alert_key ON aida_tickets (alert_key) WHERE alert_key IS NOT NULL",
 )

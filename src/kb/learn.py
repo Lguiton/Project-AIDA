@@ -8,7 +8,14 @@ NOT_LEARNED_FROM = {"knowledge", "human_escalation", "triage", "unknown"}
 MAX_RESOLUTION_CHARS = 4000
 
 
-def should_learn(status: str | None, specialist: str | None, resolution: str | None) -> bool:
+# Tools whose output is a point-in-time report about this machine, not a reusable fix
+SNAPSHOT_ONLY_TOOLS = {"security_audit"}
+
+
+def should_learn(status: str | None, specialist: str | None, resolution: str | None,
+                 tools_used: set[str] | None = None) -> bool:
+    if tools_used and tools_used <= SNAPSHOT_ONLY_TOOLS:
+        return False  # e.g. a security score changes over time; replaying it later would mislead
     return status == "resolved" and specialist not in NOT_LEARNED_FROM and bool(resolution and resolution.strip())
 
 

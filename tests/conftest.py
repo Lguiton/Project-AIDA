@@ -27,6 +27,7 @@ os.environ["AIDA_API_KEY"] = "test-api-key"
 os.environ["AIDA_UI_PASSWORD"] = "test-password"
 os.environ["AIDA_MONITOR_INTERVAL"] = "0"  # tests trigger monitoring runs explicitly
 os.environ["AIDA_SCHEDULER_INTERVAL"] = "0"  # tests run schedules explicitly
+os.environ["AIDA_MONITOR_WINDOWS"] = "off"  # Windows tests use a fake powershell.exe
 os.environ.setdefault("OPENAI_API_KEY", "not-used-in-tests")
 
 
@@ -56,6 +57,8 @@ def test_db():
         conn.execute("DROP TABLE IF EXISTS aida_audit")
         conn.execute("DROP TABLE IF EXISTS aida_users")
         conn.execute("DROP TABLE IF EXISTS aida_schedules")
+        conn.execute("DROP TABLE IF EXISTS aida_products")
+        conn.execute("DROP TABLE IF EXISTS aida_product_errors")
     return TEST_DB_URI
 
 

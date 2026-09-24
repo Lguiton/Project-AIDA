@@ -9,6 +9,7 @@ Autonomous IT Operations Help Desk by Eivanta Labs. Describe an IT problem in th
 - **Agents** (`src/graph/`): a triage router plus network, OS diagnostics, security, remediation and knowledge-base specialists.
 - **Tools** (`mcp_server.py`, MCP): read-only diagnostics run freely; `flush_dns_cache`, `restart_service` (allowlisted services only) and `clear_temp_files` run only after approval.
 - **Proactive monitoring** (`src/monitor.py`): checks disk, memory, load, failed services and TLS certificates on a schedule and opens its own tickets (one per problem).
+- **Windows monitoring** (`src/windows.py`): AIDA runs in WSL and also looks after the Windows side of the same PC through Windows PowerShell (nothing to install). Monitoring watches drive space (C:, D:...), memory, key Windows services, Microsoft Defender (real-time protection, virus definitions) and Windows Firewall. Specialists can read Windows health, top programs, event-log errors, service status and Windows Update status; fixes behind approval are restarting an allowlisted Windows service, a Defender quick scan, updating Defender definitions and clearing old Windows temp files (runbooks `windows_cleanup` and `windows_security_refresh`). Restarting Windows services needs AIDA's terminal to be started with "Run as administrator"; everything else works as a normal user.
 - **Security health check**: a scored, read-only audit (admin accounts, exposed services, SSH hardening, firewall, pending security updates, secrets-file permissions, suspicious setuid programs, failed logins).
 - **Audit log** (`src/audit.py`): every ticket, approval, denial, executed fix and knowledge change, hash-chained and append-only so tampering is detectable.
 - **Users and roles** (`src/users.py`): requesters submit tickets, approvers approve fixes and see the audit log, admins manage users. The first user, `admin`, gets the password from `AIDA_UI_PASSWORD`.
@@ -48,5 +49,6 @@ Tests use a fake AI model and fake embeddings (no OpenAI calls), a separate `aid
 
 ## Roadmap
 
+- **Windows fixes that need more rights** (installing Windows updates, BitLocker status for the compliance report): need an elevated helper; not built yet.
 - **Multiple machines**: run `mcp_server.py` on each server (for example over SSH, which MCP's stdio transport supports as `ssh host python mcp_server.py`) and connect them all to one AIDA, with machine-prefixed tools and a machine picker on each ticket.
 - **Approve from your phone**: needs the dashboard published behind HTTPS with sign-in (e.g. a reverse proxy or tunnel); notifications would then carry a one-tap approval link.

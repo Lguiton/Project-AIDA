@@ -12,7 +12,7 @@ class AidaState(TypedDict):
     messages: Annotated[list[AnyMessage], add_messages]
     
     # Overwritten on update: Tracks which agent currently owns the task
-    current_specialist: Literal["network", "knowledge", "os_diag", "security", "remediate", "human_escalation", "triage"]
+    current_specialist: Literal["network", "knowledge", "app_errors", "os_diag", "security", "remediate", "human_escalation", "triage"]
     
     # operator.add reducer appends new tool executions (lists of dicts) to the history
     tool_history: Annotated[list[dict[str, Any]], operator.add]
@@ -24,4 +24,4 @@ class AidaState(TypedDict):
     human_approval_status: Literal["pending", "approved", "rejected", "none"]
     
     # Overwritten on update: Global lifecycle of the user's issue
-    ticket_status: Literal["open", "in_progress", "resolved", "escalated", "denied", "failed", "needs_info"]
+    ticket_status: Literal["open", "in_progress", "resolved", "escalated", "denied", "failed", "needs_info", "diagnosed", "dismissed"]

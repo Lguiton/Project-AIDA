@@ -12,6 +12,8 @@ async def security_specialist_node(state: AidaState, llm, tools) -> dict:
         "for login attacks, list_listening_ports and list_recent_logins for details, scan_vulnerabilities for vulnerable packages, "
         "compliance_check for a HIPAA-oriented technical safeguards review (always state it is a self-assessment "
         "aid, not a certification or legal advice). "
+        "AIDA runs in WSL on a Windows PC: for Windows security (Microsoft Defender, antivirus, Windows Firewall) use "
+        "windows_health, and for Windows Update use windows_update_status. "
         "For a health check, report the score, then the findings from most to least severe, each with its fix. "
         "Report what you found, flag anything that looks unusual and explain why, and recommend next steps. "
         "If the evidence suggests an active compromise, say clearly that the ticket should be escalated to a human. "

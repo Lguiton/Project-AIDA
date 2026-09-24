@@ -67,6 +67,7 @@ def test_monitoring_opens_one_ticket_per_problem(api_client, monkeypatch):
 
         status = client.get("/api/monitor/status").json()
         assert status["alerts"][0]["key"] == "disk:/monitor-test"
+        assert status["windows"] is False  # tests never check the real Windows (conftest)
 
         audit = client.get("/api/audit", params={"thread_id": thread_id}).json()
         oldest = audit[-1]  # newest first

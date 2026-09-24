@@ -869,6 +869,314 @@ def install_security_updates() -> str:
 
 
 # ---------------------------------------------------------------------------
+# Windows (the same PC, reached from WSL through Windows PowerShell)
+# ---------------------------------------------------------------------------
+
+from src import windows as _win
+
+_WIN_UNAVAILABLE = ("Windows is not reachable from AIDA: {e} Windows checks only work when AIDA runs in WSL "
+                    "on the Windows PC.")
+
+
+def _pct_env(name: str, default: float) -> float:
+    try:
+        return float(os.getenv(name, default))
+    except ValueError:
+        return default
+
+
+@mcp.tool()
+def windows_health() -> str:
+    """
+    Read-only health check of the WINDOWS side of this PC (AIDA itself runs in WSL): Windows version, uptime,
+    memory, every drive's free space (C:, D:...), key Windows services, Microsoft Defender, Windows Firewall
+    and whether a restart is pending. Lists any problems found first.
+    """
+    try:
+        snap = _win.snapshot()
+    except _win.WindowsUnavailable as e:
+        return _WIN_UNAVAILABLE.format(e=e)
+    except Exception as e:
+        return f"Could not read Windows health: {e}"
+    found = _win.problems(snap, _pct_env("AIDA_MONITOR_DISK_PCT", 90), _pct_env("AIDA_MONITOR_MEM_PCT", 10))
+    lines = [f"Windows computer {snap.get('computer')}: {snap.get('os')}, up {snap.get('uptime_hours')} hours"
+             + (" (AIDA has administrator rights)" if snap.get("is_admin") else " (AIDA runs WITHOUT administrator rights)")]
+    lines.append(f"PROBLEMS FOUND: {len(found)}" if found else "PROBLEMS FOUND: none")
+    lines += [f"  - {text}" for _, _, text in found]
+    total, free = snap.get("mem_total_mb") or 0, snap.get("mem_free_mb") or 0
+    if total:
+        lines.append(f"Memory: {(total - free) / 1024:.1f} GB used of {total / 1024:.1f} GB ({free / 1024:.1f} GB free)")
+    for disk in snap["disks"]:
+        size, free_gb = disk.get("size_gb") or 0, disk.get("free_gb") or 0
+        used = (size - free_gb) / size * 100 if size else 0
+        lines.append(f"Drive {disk['drive']}: {used:.0f}% full, {free_gb:.1f} GB free of {size:.1f} GB")
+    for s in snap["services"]:
+        lines.append(f"Service {s['name']} ({s.get('display')}): {s.get('status')}" + (f", start {s['start']}" if s.get("start") else ""))
+    defender = snap.get("defender")
+    if defender:
+        lines.append(f"Microsoft Defender: mode {defender.get('mode') or 'unknown'}, antivirus "
+                     f"{'on' if defender.get('antivirus') else 'off'}, real-time protection "
+                     f"{'on' if defender.get('realtime') else 'OFF'}, definitions {defender.get('signature_age_days')} day(s) old, "
+                     f"last quick scan {defender.get('quick_scan_age_days')} day(s) ago")
+    else:
+        lines.append("Microsoft Defender: status unavailable")
+    if snap["antivirus_products"]:
+        lines.append(f"Registered antivirus: {', '.join(map(str, snap['antivirus_products']))}")
+    if snap["firewall"]:
+        lines.append("Windows Firewall: " + ", ".join(f"{p['profile']} {'on' if p.get('enabled') else 'OFF'}" for p in snap["firewall"]))
+    lines.append(f"Restart pending (updates): {'YES' if snap.get('pending_reboot') else 'no'}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def windows_top_processes(limit: int = 10, sort_by: str = "cpu") -> str:
+    """
+    Read-only: the Windows programs using the most CPU (measured over one second) or memory.
+    sort_by is 'cpu' or 'memory'. CPU is percent of the whole machine.
+    """
+    limit = max(1, min(int(limit), 30))
+    field = "mem_mb" if str(sort_by).lower().startswith("mem") else "cpu_pct"
+    script = (
+        "$a=@{}; Get-Process | ForEach-Object { $a[$_.Id]=$_.CPU }; Start-Sleep -Milliseconds 1000; "
+        "$cores=[Environment]::ProcessorCount; "
+        "$rows = Get-Process | ForEach-Object { $d = 0; if ($_.CPU -ne $null -and $a.ContainsKey($_.Id) -and $a[$_.Id] -ne $null) { $d = $_.CPU - $a[$_.Id] }; "
+        "[pscustomobject]@{ name=$_.ProcessName; pid=$_.Id; cpu_pct=[math]::Round($d*100/$cores,1); mem_mb=[int][math]::Round($_.WorkingSet64/1MB) } }; "
+        f"@($rows | Sort-Object {field} -Descending | Select-Object -First {limit}) | ConvertTo-Json -Compress"
+    )
+    try:
+        rows = _win.as_list(_win.run_json(script, timeout=60))
+    except _win.WindowsUnavailable as e:
+        return _WIN_UNAVAILABLE.format(e=e)
+    except Exception as e:
+        return f"Could not list Windows processes: {e}"
+    lines = [f"Top {len(rows)} Windows processes by {'memory' if field == 'mem_mb' else 'CPU'}:"]
+    lines += [f"  {r.get('name')} (PID {r.get('pid')}): CPU {r.get('cpu_pct')}%, memory {r.get('mem_mb')} MB" for r in rows]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def windows_event_errors(hours: int = 24, limit: int = 15) -> str:
+    """
+    Read-only: critical and error events from the Windows System and Application event logs in the last
+    `hours` hours, grouped by source and event ID (most frequent first), with the latest message of each.
+    """
+    hours = max(1, min(int(hours), 24 * 30))
+    limit = max(1, min(int(limit), 50))
+    script = (
+        f"$since=(Get-Date).AddHours(-{hours}); "
+        "$ev = Get-WinEvent -FilterHashtable @{LogName='System','Application'; Level=1,2; StartTime=$since} -MaxEvents 5000; "
+        "$total = 0; if ($ev) { $total = @($ev).Count }; "
+        f"$g = @($ev | Group-Object ProviderName,Id | Sort-Object Count -Descending | Select-Object -First {limit} | ForEach-Object {{ "
+        "$l = $_.Group | Sort-Object TimeCreated -Descending | Select-Object -First 1; "
+        "[ordered]@{ source=$l.ProviderName; id=$l.Id; log=$l.LogName; level=$l.LevelDisplayName; count=$_.Count; "
+        "last=$l.TimeCreated.ToString('yyyy-MM-dd HH:mm'); message=(\"$($l.Message)\" -split \"`n\")[0].Trim() } }); "
+        "[ordered]@{ total=$total; groups=$g } | ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        data = _win.run_json(script, timeout=90)
+    except _win.WindowsUnavailable as e:
+        return _WIN_UNAVAILABLE.format(e=e)
+    except Exception as e:
+        return f"Could not read the Windows event logs: {e}"
+    groups = _win.as_list(data.get("groups"))
+    if not data.get("total"):
+        return f"No critical or error events in the Windows System/Application logs in the last {hours} hour(s)."
+    lines = [f"{data['total']} critical/error event(s) in the Windows System/Application logs in the last {hours} hour(s); "
+             f"top {len(groups)} by frequency:"]
+    for g in groups:
+        lines.append(f"  {g.get('count')}x {g.get('level')} {g.get('source')} (event {g.get('id')}, {g.get('log')} log), "
+                     f"last at {g.get('last')}: {str(g.get('message') or '')[:200]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def windows_service_status(service_name: str) -> str:
+    """Read-only: status of one Windows service by its service name (e.g. Spooler, WinDefend, wuauserv)."""
+    if not _win.SERVICE_NAME.match(service_name or ""):
+        return f"REFUSED: {service_name!r} is not a valid Windows service name."
+    script = (
+        f"$s = Get-CimInstance Win32_Service -Filter \"Name='{service_name}'\"; "
+        "if (-not $s) { '{\"found\":false}' } else { [ordered]@{ found=$true; name=$s.Name; display=$s.DisplayName; state=$s.State; "
+        "start=$s.StartMode; pid=$s.ProcessId; exit_code=$s.ExitCode } | ConvertTo-Json -Compress }"
+    )
+    try:
+        data = _win.run_json(script, timeout=60)
+    except _win.WindowsUnavailable as e:
+        return _WIN_UNAVAILABLE.format(e=e)
+    except Exception as e:
+        return f"Could not read Windows service {service_name}: {e}"
+    if not data.get("found"):
+        return f"There is no Windows service named {service_name}."
+    text = (f"Windows service {data['name']} ({data.get('display')}): {data.get('state')}, start mode {data.get('start')}"
+            + (f", process ID {data['pid']}" if data.get("pid") else ""))
+    if data.get("state") != "Running" and data.get("exit_code"):
+        text += f", last exit code {data['exit_code']}"
+    return text
+
+
+@mcp.tool()
+def windows_update_status() -> str:
+    """
+    Read-only: Windows Update status: updates waiting to install (security updates marked), the most recent
+    installed update and whether a restart is pending. Can take a minute or two.
+    """
+    script = (
+        "$r=[ordered]@{}; "
+        "$hf = Get-HotFix | Where-Object { $_.InstalledOn } | Sort-Object InstalledOn -Descending | Select-Object -First 1; "
+        "if ($hf) { $r.last_update = \"$($hf.HotFixID) on $($hf.InstalledOn.ToString('yyyy-MM-dd'))\" }; "
+        "try { $res = (New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher().Search(\"IsInstalled=0 and IsHidden=0 and Type='Software'\"); "
+        "$r.pending = @($res.Updates | ForEach-Object { [ordered]@{ title=$_.Title; severity=\"$($_.MsrcSeverity)\"; "
+        "security=[bool](@($_.Categories | Where-Object { $_.Name -match 'Security' }).Count) } }) } "
+        "catch { $r.search_error = $_.Exception.Message }; "
+        "$r.pending_reboot = (Test-Path 'HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\WindowsUpdate\\Auto Update\\RebootRequired'); "
+        "$r | ConvertTo-Json -Depth 4 -Compress"
+    )
+    try:
+        data = _win.run_json(script, timeout=300)
+    except _win.WindowsUnavailable as e:
+        return _WIN_UNAVAILABLE.format(e=e)
+    except Exception as e:
+        return f"Could not check Windows Update: {e}"
+    pending = _win.as_list(data.get("pending"))
+    lines = [f"Most recent installed update: {data.get('last_update') or 'unknown'}"]
+    if data.get("search_error"):
+        lines.append(f"Could not search for pending updates: {data['search_error']}")
+    elif pending:
+        security = [p for p in pending if p.get("security")]
+        lines.append(f"{len(pending)} update(s) waiting to install, {len(security)} of them security updates:")
+        lines += [f"  - {p.get('title')}" + (f" [security{', ' + p['severity'] if p.get('severity') else ''}]" if p.get("security") else "")
+                  for p in pending[:25]]
+        lines.append("Install them from Settings > Windows Update (AIDA does not install Windows updates itself).")
+    else:
+        lines.append("No updates waiting to install.")
+    lines.append(f"Restart pending to finish updates: {'YES' if data.get('pending_reboot') else 'no'}")
+    return "\n".join(lines)
+
+
+_NOT_ADMIN_HINT = ("AIDA's Windows commands are running without administrator rights. To allow this fix, start the "
+                   "terminal that runs AIDA with 'Run as administrator' (Windows Terminal: right-click > Run as "
+                   "administrator), then start AIDA again; or do it yourself in Windows (services.msc / Windows Security).")
+
+
+@mcp.tool()
+def windows_restart_service(service_name: str) -> str:
+    """
+    Restarts a Windows service (by service name, e.g. Spooler for the print spooler) and checks it came back.
+    Changes system state, so it only runs after a human approves it. Only services on AIDA's Windows allowlist
+    can be restarted, and Windows requires administrator rights.
+    """
+    allowed = _win.restartable_services()
+    if not _win.SERVICE_NAME.match(service_name or "") or service_name.lower() not in {a.lower() for a in allowed}:
+        return (f"REFUSED: {service_name!r} is not on the Windows restart allowlist ({', '.join(allowed)}). Nothing was "
+                f"restarted. Add it to AIDA_WINDOWS_RESTARTABLE_SERVICES in .env to allow it.")
+    name = next(a for a in allowed if a.lower() == service_name.lower())
+    script = (
+        "if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole("
+        "[Security.Principal.WindowsBuiltInRole]::Administrator)) { 'NOT_ADMIN'; exit 0 }; "
+        f"try {{ Restart-Service -Name '{name}' -Force -ErrorAction Stop; Start-Sleep -Seconds 2; "
+        f"\"STATUS:$((Get-Service -Name '{name}').Status)\" }} catch {{ \"ERROR:$($_.Exception.Message -replace '\\s+', ' ')\" }}"
+    )
+    try:
+        ok, output = _win.run(script, timeout=90)
+    except _win.WindowsUnavailable as e:
+        return f"FAILED: {e}"
+    markers = [l.strip() for l in output.splitlines() if l.strip().startswith(("NOT_ADMIN", "STATUS:", "ERROR:"))]
+    last = markers[-1] if markers else output.strip()[-300:]
+    if not ok:
+        return f"FAILED: could not restart the Windows service {name}: {output}"
+    if last == "NOT_ADMIN":
+        return f"FAILED: could not restart the Windows service {name}: administrator rights are needed. {_NOT_ADMIN_HINT}"
+    if last.startswith("ERROR:"):
+        return f"FAILED: Windows refused to restart {name}: {last[6:]}"
+    if last == "STATUS:Running":
+        return f"SUCCESS: restarted the Windows service {name}; it is now running."
+    return f"WARNING: restarted the Windows service {name}, but it is now {last.replace('STATUS:', '') or 'in an unknown state'}."
+
+
+_MPCMDRUN = ("$mp = Join-Path $(if ($env:ProgramFiles) { $env:ProgramFiles } else { 'C:\\Program Files' }) "
+             "'Windows Defender\\MpCmdRun.exe'; if (-not (Test-Path $mp)) { 'NO_DEFENDER'; exit 0 }; ")
+
+
+@mcp.tool()
+def windows_defender_scan() -> str:
+    """
+    Starts a Microsoft Defender QUICK scan of Windows in the background. Changes system state (uses CPU for
+    several minutes), so it only runs after a human approves it. Results appear in Windows Security.
+    """
+    script = _MPCMDRUN + "Start-Process -FilePath $mp -ArgumentList '-Scan','-ScanType','1' -WindowStyle Hidden -ErrorAction Stop; 'STARTED'"
+    try:
+        ok, output = _win.run(script, timeout=60)
+    except _win.WindowsUnavailable as e:
+        return f"FAILED: {e}"
+    if ok and output.strip().endswith("STARTED"):
+        return ("SUCCESS: started a Microsoft Defender quick scan in the background. It usually takes 5-15 minutes; "
+                "results and anything Defender removes appear in Windows Security > Protection history.")
+    if "NO_DEFENDER" in output:
+        return "FAILED: Microsoft Defender's command-line scanner (MpCmdRun.exe) was not found on Windows."
+    return f"FAILED: could not start the Defender scan: {output}"
+
+
+@mcp.tool()
+def windows_update_signatures() -> str:
+    """
+    Updates Microsoft Defender's virus definitions on Windows. Changes system state, so it only runs after a
+    human approves it.
+    """
+    script = (_MPCMDRUN + "$out = & $mp -SignatureUpdate 2>&1 | Out-String; $code = $LASTEXITCODE; "
+              "$s = Get-MpComputerStatus; "
+              "[ordered]@{ code=$code; output=$out.Trim(); age=$(if ($s) { [int]$s.AntivirusSignatureAge } else { $null }); "
+              "version=$(if ($s) { \"$($s.AntivirusSignatureVersion)\" } else { '' }) } | ConvertTo-Json -Compress")
+    try:
+        ok, output = _win.run(script, timeout=600)
+    except _win.WindowsUnavailable as e:
+        return f"FAILED: {e}"
+    if "NO_DEFENDER" in output:
+        return "FAILED: Microsoft Defender's command-line tool (MpCmdRun.exe) was not found on Windows."
+    try:
+        start = output.index("{")
+        data = json.loads(output[start:])
+    except ValueError:
+        return f"FAILED: could not update Defender definitions: {output[:500]}"
+    if data.get("code") == 0:
+        return (f"SUCCESS: Microsoft Defender definitions are up to date (version {data.get('version') or 'unknown'}, "
+                f"{data.get('age')} day(s) old).")
+    detail = (data.get("output") or "").splitlines()[-1:] or [""]
+    return f"FAILED: Defender definition update returned code {data.get('code')}: {detail[0][:300]}"
+
+
+@mcp.tool()
+def windows_clear_temp(older_than_days: int = 7) -> str:
+    """
+    Deletes the Windows user's own temp files (AppData\\Local\\Temp) not modified for older_than_days days
+    (minimum 1). Skips files in use and never follows links out of the temp folder. Changes system state, so it
+    only runs after a human approves it.
+    """
+    days = max(1, int(older_than_days))
+    script = (
+        "$t = [IO.Path]::GetTempPath(); $home_dir = $env:USERPROFILE; "
+        "if (-not $home_dir -or -not $t.StartsWith($home_dir, [StringComparison]::OrdinalIgnoreCase)) { \"REFUSE:$t\"; exit 0 }; "
+        f"$cut = (Get-Date).AddDays(-{days}); $script:n = 0; $script:bytes = 0; $script:skipped = 0; "
+        "function Walk($dir) { Get-ChildItem -LiteralPath $dir -Force | ForEach-Object { "
+        "if ($_.Attributes -band [IO.FileAttributes]::ReparsePoint) { return }; "
+        "if ($_.PSIsContainer) { Walk $_.FullName } elseif ($_.LastWriteTime -lt $cut) { $len = $_.Length; "
+        "try { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop; $script:n++; $script:bytes += $len } catch { $script:skipped++ } } } }; "
+        "Walk $t; [ordered]@{ dir=$t; deleted=$script:n; mb=[math]::Round($script:bytes/1MB,1); skipped=$script:skipped } | ConvertTo-Json -Compress"
+    )
+    try:
+        ok, output = _win.run(script, timeout=600)
+    except _win.WindowsUnavailable as e:
+        return f"FAILED: {e}"
+    if "REFUSE:" in output:
+        return f"REFUSED: the Windows temp folder ({output.split('REFUSE:', 1)[1].strip()}) is not inside the user's profile; nothing was deleted."
+    try:
+        data = json.loads(output[output.index("{"):])
+    except ValueError:
+        return f"FAILED: could not clear Windows temp files: {output[:500]}"
+    return (f"SUCCESS: deleted {data['deleted']} Windows temp file(s) older than {days} day(s) from {data['dir']}, "
+            f"freeing {data['mb']} MB" + (f"; skipped {data['skipped']} file(s) that are in use." if data.get("skipped") else "."))
+
+
+# ---------------------------------------------------------------------------
 # Runbooks: several steps, one approval
 # ---------------------------------------------------------------------------
 
@@ -885,6 +1193,14 @@ RUNBOOKS: dict[str, dict] = {
     "security_patch": {
         "description": "Install pending security updates, then re-run the security health check.",
         "steps": [("install_security_updates", {}), ("security_audit", {})],
+    },
+    "windows_cleanup": {
+        "description": "Free space on Windows: delete the Windows user's old temp files, then re-check Windows health.",
+        "steps": [("windows_clear_temp", {"older_than_days": 7}), ("windows_health", {})],
+    },
+    "windows_security_refresh": {
+        "description": "Update Microsoft Defender's virus definitions, then start a Defender quick scan.",
+        "steps": [("windows_update_signatures", {}), ("windows_defender_scan", {})],
     },
 }
 

@@ -1,5 +1,6 @@
 import asyncio
 import hmac
+import json
 import os
 import sys
 import uuid
@@ -10,7 +11,8 @@ from dotenv import load_dotenv
 # Load .env before importing modules that read environment variables
 load_dotenv()
 
-from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException
+from fastapi import APIRouter, Depends, FastAPI, Header, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from langchain_openai import ChatOpenAI
@@ -20,7 +22,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from src import audit, monitor, notify, reports, scheduler, users
+from src import audit, monitor, notify, products, reports, scheduler, users, windows
 from src.db import DB_URI, KB_COLLECTION, TICKETS_TABLE_SQL
 from src.graph.graph import compile_aida_graph
 from src.kb.learn import forget_ticket, learn_from_ticket, should_learn
@@ -66,6 +68,7 @@ async def lifespan(app: FastAPI):
             await conn.execute(statement)
     await audit.ensure_audit_schema(db_pool)
     await scheduler.ensure_schema(db_pool)
+    await products.ensure_schema(db_pool)
     note = await users.ensure_users(db_pool)
     if note:
         print(f"[System] {note}")
@@ -93,10 +96,12 @@ async def lifespan(app: FastAPI):
 
     net_tools = pick("ping_host", "resolve_dns", "get_adapter_status")
     rem_tools = pick("flush_dns_cache", "restart_service", "clear_temp_files", "rotate_logs", "docker_prune",
-                     "restart_container", "block_ip", "unblock_ip", "install_security_updates", "run_runbook")
-    os_tools = pick("get_system_info", "check_disk_usage", "list_top_processes", "check_service_status")
+                     "restart_container", "block_ip", "unblock_ip", "install_security_updates", "run_runbook",
+                     "windows_restart_service", "windows_defender_scan", "windows_update_signatures", "windows_clear_temp")
+    os_tools = pick("get_system_info", "check_disk_usage", "list_top_processes", "check_service_status",
+                    "windows_health", "windows_top_processes", "windows_event_errors", "windows_service_status")
     sec_tools = pick("list_listening_ports", "list_recent_logins", "security_audit", "list_failed_logins",
-                     "scan_vulnerabilities", "compliance_check")
+                     "scan_vulnerabilities", "compliance_check", "windows_health", "windows_update_status")
 
     # 4. Compile the graph with injected tools and the Postgres checkpointer
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -110,7 +115,8 @@ async def lifespan(app: FastAPI):
     monitor_lock = asyncio.Lock()
     interval = float(os.getenv("AIDA_MONITOR_INTERVAL", "300") or 0)
     if interval > 0:
-        monitor_task = asyncio.create_task(monitor.monitor_loop(db_pool, open_monitor_ticket, interval, monitor_lock))
+        monitor_task = asyncio.create_task(monitor.monitor_loop(
+            db_pool, open_monitor_ticket, interval, monitor_lock, extra_collect=product_health_alerts))
         print(f"[System] Monitoring every {interval:.0f}s (set AIDA_MONITOR_INTERVAL=0 to turn off).")
 
     # 6. Scheduled maintenance (runbooks approved in advance by an admin)
@@ -414,10 +420,12 @@ async def list_tickets(limit: int = 50, user: dict = requester):
     async with db_pool.connection() as conn:
         rows = await (await conn.execute(
             """
-            SELECT thread_id, issue, status, current_specialist, requires_approval,
-                   last_message, learned, forgotten, source, alert_key, created_at, updated_at
-            FROM aida_tickets
-            ORDER BY created_at DESC
+            SELECT t.thread_id, t.issue, t.status, t.current_specialist, t.requires_approval,
+                   t.last_message, t.learned, t.forgotten, t.source, t.alert_key, t.created_at, t.updated_at,
+                   e.occurrences, e.tenants, e.last_seen, e.product_id
+            FROM aida_tickets t
+            LEFT JOIN aida_product_errors e ON e.alert_key = t.alert_key
+            ORDER BY t.created_at DESC
             LIMIT %s
             """,
             (limit,),
@@ -521,14 +529,14 @@ async def audit_verify(user: dict = approver):
 @api.get("/monitor/status")
 async def monitor_status(user: dict = requester):
     interval = float(os.getenv("AIDA_MONITOR_INTERVAL", "300") or 0)
-    return {"enabled": interval > 0, "interval_seconds": interval, **monitor.last_run}
+    return {"enabled": interval > 0, "interval_seconds": interval, "windows": windows.monitoring_enabled(), **monitor.last_run}
 
 
 @api.post("/monitor/run")
 async def monitor_run(user: dict = approver):
     actor = user["username"]
     """Run all health checks now (tickets are only opened for new problems)."""
-    result = await monitor.run_once(db_pool, open_monitor_ticket, lock=monitor_lock)
+    result = await monitor.run_once(db_pool, open_monitor_ticket, lock=monitor_lock, extra_collect=product_health_alerts)
     await audit.record(db_pool, actor, "monitor.run", None,
                        {"alerts": len(result["alerts"]), "opened": [o["alert_key"] for o in result["opened"]]})
     return result
@@ -740,6 +748,160 @@ async def run_schedule_now(schedule_id: int, user: dict = admin):
                                         notify_maintenance_failure, trigger=f"manual by {user['username']}")
 
 
+# ---- Connected products (Eivanta Analytics and future SaaS products) -------------------
+
+_opening_alerts: set[str] = set()  # alert keys whose ticket is being created right now
+
+
+async def product_health_alerts() -> list:
+    """Monitoring hook: one alert per connected, unpaused product whose health check fails."""
+    alerts = []
+    for product in await products.list_products(db_pool):
+        if product["paused"] or not product["health_url"]:
+            continue
+        problem = await asyncio.to_thread(products.check_health, product["health_url"])
+        if problem:
+            alerts.append(monitor.Alert(
+                key=f"health:{product['id']}", check="product_health",
+                issue=(f"{monitor.AUTO_PREFIX} {product['name']} ({product['environment']}) is unhealthy: {problem}. "
+                       f"Health check: {product['health_url']}"),
+            ))
+    return alerts
+
+
+async def _open_product_error_ticket(product: dict, report: dict, alert_key: str) -> None:
+    try:
+        ticket = await start_ticket(products.issue_text(product, report), actor=f"product:{product['id']}",
+                                    source="product", alert_key=alert_key)
+        notify.send_in_background(
+            "auto_ticket",
+            f"{product['name']}: unhandled {report.get('error_type')} on {report.get('method')} {report.get('route')}",
+            ticket["thread_id"])
+    except Exception as e:
+        print(f"[Intake] Could not open a ticket for {alert_key}: {e}")
+    finally:
+        _opening_alerts.discard(alert_key)
+
+
+intake = APIRouter(prefix="/intake", tags=["Product intake"])
+
+
+@intake.post("/errors")
+async def intake_error(request: Request, x_aida_product: str | None = Header(default=None),
+                       x_aida_timestamp: str | None = Header(default=None),
+                       x_aida_signature: str | None = Header(default=None)):
+    """Error reports from connected products, authenticated by each product's own signing secret."""
+    body = await request.body()
+    if len(body) > products.MAX_REPORT_BYTES:
+        return JSONResponse(status_code=413, content={"detail": "Report too large."})
+    product = await products.get_product(db_pool, x_aida_product or "", with_secret=True)
+    if not product:
+        return JSONResponse(status_code=401, content={"detail": "Unknown product or invalid signature."})
+    problem = products.verify(product["intake_secret"], x_aida_timestamp, x_aida_signature, body)
+    if problem:
+        return JSONResponse(status_code=401, content={"detail": f"Rejected: {problem}."})
+    if product["paused"]:
+        return JSONResponse(status_code=423, content={"detail": f"{product['name']} is paused in AIDA."})
+    try:
+        report = json.loads(body)
+        assert isinstance(report, dict) and report.get("product") == product["id"] and report.get("error_type")
+    except (ValueError, AssertionError):
+        return JSONResponse(status_code=400, content={"detail": "Malformed report."})
+
+    alert_key = products.alert_key_for(product["id"], report)
+    occurrences = await products.record_occurrence(db_pool, alert_key, product["id"], report)
+    if alert_key in _opening_alerts or await monitor._has_active_ticket(db_pool, alert_key, cooldown_hours=0):
+        return {"status": "grouped", "alert_key": alert_key, "occurrences": occurrences}
+    _opening_alerts.add(alert_key)
+    task = asyncio.create_task(_open_product_error_ticket(product, report, alert_key))
+    notify._background.add(task)
+    task.add_done_callback(notify._background.discard)
+    return JSONResponse(status_code=202, content={"status": "accepted", "alert_key": alert_key, "occurrences": occurrences})
+
+
+class NewProduct(BaseModel):
+    id: str
+    name: str
+    environment: str = "local"
+    health_url: str | None = None
+
+
+class ProductUpdate(BaseModel):
+    paused: bool | None = None
+    health_url: str | None = None
+    rotate_secret: bool = False
+
+
+@api.get("/products")
+async def get_products(user: dict = approver):
+    return await products.list_products(db_pool)
+
+
+@api.post("/products")
+async def add_product(new: NewProduct, user: dict = admin):
+    product_id = new.id.strip().lower()
+    if not products.valid_slug(product_id):
+        raise HTTPException(status_code=400, detail="Product id: lowercase letters, digits and dashes, e.g. eivanta-analytics.")
+    if new.health_url and not new.health_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Health URL must start with http:// or https://.")
+    try:
+        secret = await products.add_product(db_pool, product_id, new.name.strip()[:80] or product_id,
+                                            new.environment.strip()[:20] or "local", new.health_url, user["username"])
+    except Exception:
+        raise HTTPException(status_code=409, detail=f"Product '{product_id}' already exists.")
+    await audit.record(db_pool, user["username"], "product.added", None,
+                       {"product": product_id, "environment": new.environment, "health_url": new.health_url})
+    return {"id": product_id, "intake_secret": secret,
+            "note": "Copy this secret into the product's .env as AIDA_INTAKE_SECRET now; it is not shown again."}
+
+
+@api.post("/products/{product_id}")
+async def change_product(product_id: str, change: ProductUpdate, user: dict = admin):
+    if not await products.get_product(db_pool, product_id):
+        raise HTTPException(status_code=404, detail="Product not found")
+    if change.health_url and not change.health_url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="Health URL must start with http:// or https://.")
+    secret = await products.update_product(db_pool, product_id, change.paused, change.health_url, change.rotate_secret)
+    details = {k: v for k, v in change.model_dump().items() if v not in (None, False)}
+    await audit.record(db_pool, user["username"], "product.updated", None, {"product": product_id, **details})
+    return {"id": product_id, **details, **({"intake_secret": secret} if secret else {})}
+
+
+class CloseRequest(BaseModel):
+    resolution: str = "resolved"
+    note: str | None = None
+
+
+@api.post("/tickets/{thread_id}/close")
+async def close_ticket(thread_id: str, request: CloseRequest, user: dict = approver):
+    """Close a diagnosed or otherwise open ticket once the underlying problem is fixed (or not worth fixing)."""
+    if request.resolution not in ("resolved", "dismissed"):
+        raise HTTPException(status_code=400, detail="Resolution must be 'resolved' or 'dismissed'.")
+    config = {"configurable": {"thread_id": thread_id}}
+    state = await aida_graph.aget_state(config)
+    if state.values:
+        if state.next and "remediate_tools" in state.next:
+            raise HTTPException(status_code=400, detail="This ticket is waiting for approval; approve or deny it instead.")
+        node = state.values.get("current_specialist")
+        if node not in aida_graph.get_graph().nodes:
+            node = "human_escalation"
+        await aida_graph.aupdate_state(config, {"ticket_status": request.resolution}, as_node=node)
+        ticket = await snapshot_ticket(thread_id, learn=False)
+    else:
+        async with db_pool.connection() as conn:
+            row = await (await conn.execute(
+                "UPDATE aida_tickets SET status = %s, updated_at = now() WHERE thread_id = %s RETURNING thread_id",
+                (request.resolution, thread_id))).fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="Ticket not found")
+        ticket = {"thread_id": thread_id, "status": request.resolution}
+    await audit.record(db_pool, user["username"], "ticket.closed", thread_id,
+                       {"resolution": request.resolution, "note": (request.note or "")[:500]})
+    if state.values and request.resolution == "resolved":
+        await maybe_learn(ticket)
+    return ticket
+
+
 @api.get("/metrics")
 async def metrics(user: dict = requester):
     """Live numbers for the dashboard."""
@@ -785,3 +947,4 @@ async def metrics(user: dict = requester):
 
 # Register the protected /api routes (must come after they are defined)
 app.include_router(api)
+app.include_router(intake)

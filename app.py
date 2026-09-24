@@ -234,16 +234,35 @@ with tickets_tab:
                 thread_id = ticket["thread_id"]
                 created = format_timestamp(ticket.get("created_at"))
                 specialist = (ticket.get("current_specialist") or "unknown").upper()
-                is_open = ticket.get("status") not in ("resolved", "denied", "failed") or ticket.get("requires_approval")
-                origin = {"monitor": "🤖 Auto-detected · ", "schedule": "🗓️ Scheduled · "}.get(ticket.get("source"), "")
+                is_open = ticket.get("status") not in ("resolved", "denied", "failed", "dismissed") or ticket.get("requires_approval")
+                origin = {"monitor": "🤖 Auto-detected · ", "schedule": "🗓️ Scheduled · ",
+                          "product": f"🧩 {ticket.get('product_id') or 'Product'} error · "}.get(ticket.get("source"), "")
                 with st.expander(f"{origin}Ticket {thread_id[:8]} - Specialist: {specialist} - {created}", expanded=bool(is_open)):
                     st.markdown(f"**Issue:** {ticket.get('issue')}")
                     st.markdown(f"**Status:** `{ticket.get('status')}`")
+                    if ticket.get("occurrences"):
+                        tenants = ticket.get("tenants") or []
+                        st.caption(f"Seen {ticket['occurrences']} time(s), last {format_timestamp(ticket.get('last_seen'))}"
+                                   + (f" · tenants: {', '.join(tenants[:5])}{' …' if len(tenants) > 5 else ''}" if tenants else ""))
                     st.markdown(f"**Agent Response:**\n{ticket.get('last_message') or ''}")
                     if ticket.get("learned"):
                         st.caption("📚 Added to the knowledge base for future tickets.")
                         if CAN_APPROVE and st.button("Remove from knowledge base", key=f"forget_{thread_id}"):
                             forget_ticket(thread_id)
+                            st.rerun()
+
+                    # Close a diagnosed / waiting ticket once it's handled
+                    closable = ticket.get("status") in ("diagnosed", "needs_info", "escalated", "in_progress") \
+                        and not ticket.get("requires_approval")
+                    if CAN_APPROVE and closable:
+                        r_col, d_col, _ = st.columns([1, 1, 3])
+                        if r_col.button("Mark resolved", key=f"resolve_{thread_id}",
+                                        help="The problem is fixed. If it happens again, AIDA opens a new ticket."):
+                            api_call("POST", f"/tickets/{thread_id}/close", "Could not close the ticket", json={"resolution": "resolved"})
+                            st.rerun()
+                        if d_col.button("Dismiss", key=f"dismiss_{thread_id}",
+                                        help="Not worth fixing. Repeats are counted on this ticket instead of opening new ones."):
+                            api_call("POST", f"/tickets/{thread_id}/close", "Could not close the ticket", json={"resolution": "dismissed"})
                             st.rerun()
 
                     # Human-in-the-Loop Gateway
@@ -277,6 +296,10 @@ if audit_tab is not None:
                     st.caption(f"Checks run every {status['interval_seconds'] / 60:.0f} minute(s) and open tickets for new problems.")
                 else:
                     st.caption("Scheduled checks are off (AIDA_MONITOR_INTERVAL=0). Use 'Run health checks now'.")
+                if status.get("windows"):
+                    st.caption("🪟 Also checking Windows on this PC: drives, memory, key services, Defender and firewall.")
+                else:
+                    st.caption("🪟 Windows checks are off (Windows is not reachable from AIDA, or AIDA_MONITOR_WINDOWS=off).")
                 if status.get("checked_at"):
                     st.write(f"Last run: {format_timestamp(status['checked_at'])}")
                     if status.get("error"):
@@ -316,6 +339,46 @@ if audit_tab is not None:
 
 if admin_tab is not None:
     with admin_tab:
+        st.subheader("Connected products")
+        st.caption("SaaS products that report errors to AIDA and have their health checked. "
+                   "Each has its own signing secret; paused products' reports are refused.")
+        product_list = api_call("GET", "/products", "Could not load products") or []
+        for prod in product_list:
+            with st.container(border=True):
+                st.markdown(f"**{prod['name']}** (`{prod['id']}`, {prod['environment']}) — "
+                            f"{'⏸️ paused' if prod['paused'] else '✅ active'}"
+                            + (f" · health: {prod['health_url']}" if prod.get("health_url") else " · no health check"))
+                p1, p2, _ = st.columns([1, 1, 3])
+                if p1.button("Resume" if prod["paused"] else "Pause", key=f"pause_{prod['id']}"):
+                    api_call("POST", f"/products/{prod['id']}", "Update failed", json={"paused": not prod["paused"]})
+                    st.rerun()
+                if p2.button("New secret", key=f"rotate_{prod['id']}",
+                             help="Issue a new signing secret; the old one stops working immediately."):
+                    rotated = api_call("POST", f"/products/{prod['id']}", "Rotation failed", json={"rotate_secret": True})
+                    if rotated and rotated.get("intake_secret"):
+                        st.session_state.new_product_secret = (prod["id"], rotated["intake_secret"])
+        with st.form("add_product", clear_on_submit=True):
+            st.markdown("**Connect a product**")
+            pc1, pc2 = st.columns(2)
+            new_pid = pc1.text_input("Product id", value="eivanta-analytics")
+            new_pname = pc2.text_input("Name", value="Eivanta Analytics")
+            pc3, pc4 = st.columns([1, 2])
+            new_env = pc3.selectbox("Environment", ["local", "staging", "production"])
+            new_health = pc4.text_input("Health URL (optional)", value="http://127.0.0.1:8000/api/v1/status")
+            if st.form_submit_button("Connect product"):
+                created = api_call("POST", "/products", "Could not connect product",
+                                   json={"id": new_pid, "name": new_pname, "environment": new_env, "health_url": new_health})
+                if created:
+                    st.session_state.new_product_secret = (created["id"], created["intake_secret"])
+        if st.session_state.get("new_product_secret"):
+            pid, secret = st.session_state.new_product_secret
+            st.warning(f"Signing secret for **{pid}** — add these lines to that product's backend `.env` now. "
+                       "It is shown only once.")
+            st.code(f"AIDA_INTAKE_URL=http://127.0.0.1:8006/intake/errors\nAIDA_INTAKE_SECRET={secret}", language="bash")
+            if st.button("I've copied it"):
+                st.session_state.pop("new_product_secret", None)
+                st.rerun()
+        st.divider()
         users_col, notify_col = st.columns([1.3, 1])
         with users_col:
             st.subheader("Users")

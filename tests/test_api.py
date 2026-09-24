@@ -90,8 +90,8 @@ def test_metrics_report_live_numbers(api_client):
     with api_client() as client:
         create(client, "please flush my dns")
         metrics = client.get("/api/metrics").json()
-    assert metrics["agent_count"] == 6
-    assert set(metrics["agents"]) == {"knowledge", "network", "os_diag", "remediate", "security", "triage"}
+    assert metrics["agent_count"] == 7
+    assert set(metrics["agents"]) == {"app_errors", "knowledge", "network", "os_diag", "remediate", "security", "triage"}
     assert metrics["pending_approvals"] >= 1
     assert metrics["kb_online"] is True
 

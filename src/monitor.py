@@ -16,6 +16,8 @@ Settings (.env):
   AIDA_MONITOR_CERT_DAYS     alert when a certificate expires within this many days (default 14)
   AIDA_MONITOR_FAILED_LOGINS alert when one IP fails this many logins in the window (default 20)
   AIDA_MONITOR_LOGIN_WINDOW_HOURS  window for failed-login counting (default 1)
+  AIDA_MONITOR_WINDOWS       auto (default) | on | off -- also check the Windows side of this PC (see src/windows.py);
+                             the disk and memory thresholds above apply to Windows drives and memory too
 """
 import asyncio
 import os
@@ -178,9 +180,28 @@ def check_failed_logins(threshold: float | None = None, hours: float | None = No
     return alerts
 
 
+def check_windows(snapshot=None) -> list[Alert]:
+    """The Windows side of this PC: drives, memory, key services, Defender and firewall (one PowerShell call)."""
+    from src import windows
+    if snapshot is None:
+        if not windows.monitoring_enabled():
+            return []
+        snapshot = windows.snapshot
+    try:
+        snap = snapshot()
+    except Exception as e:
+        print(f"[Monitor] Windows check skipped: {e}")
+        return []
+    return [
+        Alert(key=key, check=check, issue=f"{AUTO_PREFIX} [Windows] {text}")
+        for key, check, text in windows.problems(snap, _env_float("AIDA_MONITOR_DISK_PCT", 90), _env_float("AIDA_MONITOR_MEM_PCT", 10))
+    ]
+
+
 def collect_alerts() -> list[Alert]:
     alerts: list[Alert] = []
-    for check in (check_disks, check_memory, check_load, check_failed_services, check_certificates, check_failed_logins):
+    for check in (check_disks, check_memory, check_load, check_failed_services, check_certificates, check_failed_logins,
+                  check_windows):
         try:
             alerts.extend(check())
         except Exception as e:  # one broken check must not stop the others
@@ -210,14 +231,20 @@ async def _has_active_ticket(pool, alert_key: str, cooldown_hours: float) -> boo
     return row is not None
 
 
-async def run_once(pool, open_ticket, collect=None, lock: asyncio.Lock | None = None) -> dict:
-    """Run all checks; open a ticket for each new problem. `open_ticket(alert)` returns the ticket."""
+async def run_once(pool, open_ticket, collect=None, lock: asyncio.Lock | None = None, extra_collect=None) -> dict:
+    """Run all checks; open a ticket for each new problem. `open_ticket(alert)` returns the ticket.
+    `extra_collect` is an optional async function returning more Alerts (e.g. connected products' health)."""
     if lock is not None:
         async with lock:  # the schedule and a manual "run now" must not open the same ticket twice
-            return await run_once(pool, open_ticket, collect)
+            return await run_once(pool, open_ticket, collect, extra_collect=extra_collect)
     collect = collect or collect_alerts
     cooldown = _env_float("AIDA_MONITOR_COOLDOWN", 6)
     alerts = await asyncio.to_thread(collect)
+    if extra_collect is not None:
+        try:
+            alerts = alerts + list(await extra_collect())
+        except Exception as e:
+            print(f"[Monitor] product checks failed: {e}")
     opened, suppressed = [], []
     for alert in alerts:
         if await _has_active_ticket(pool, alert.key, cooldown):
@@ -235,11 +262,11 @@ async def run_once(pool, open_ticket, collect=None, lock: asyncio.Lock | None = 
     return dict(last_run)
 
 
-async def monitor_loop(pool, open_ticket, interval: float, lock: asyncio.Lock | None = None) -> None:
+async def monitor_loop(pool, open_ticket, interval: float, lock: asyncio.Lock | None = None, extra_collect=None) -> None:
     """Background task started with the API. Survives individual failures."""
     while True:
         try:
-            result = await run_once(pool, open_ticket, lock=lock)
+            result = await run_once(pool, open_ticket, lock=lock, extra_collect=extra_collect)
             if result["opened"]:
                 print(f"[Monitor] Opened {len(result['opened'])} ticket(s): {[o['alert_key'] for o in result['opened']]}")
         except asyncio.CancelledError:

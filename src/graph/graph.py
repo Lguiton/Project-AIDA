@@ -14,7 +14,7 @@ from src.graph.security import security_specialist_node
 async def mock_escalation_node(state: AidaState):
     return {"ticket_status": "escalated"}
 
-def compile_aida_graph(llm, network_tools, remediation_tools, os_tools, security_tools):
+def compile_aida_graph(llm, network_tools, remediation_tools, os_tools, security_tools, checkpointer=None):
     workflow = StateGraph(AidaState)
 
     # Inject the LLM and the dynamically provided tools into each node
@@ -65,5 +65,5 @@ def compile_aida_graph(llm, network_tools, remediation_tools, os_tools, security
 
     workflow.add_edge("human_escalation", END)
 
-    memory = MemorySaver()
-    return workflow.compile(checkpointer=memory, interrupt_before=["remediate_tools"])
+    # Postgres checkpointer in production (tickets survive restarts); in-memory fallback for tests
+    return workflow.compile(checkpointer=checkpointer or MemorySaver(), interrupt_before=["remediate_tools"])

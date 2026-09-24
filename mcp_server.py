@@ -1,5 +1,8 @@
 import os
 import platform
+import pwd
+import re
+import time
 import shutil
 import socket
 import subprocess
@@ -135,26 +138,132 @@ def check_disk_usage(path: str = "/") -> str:
         return f"Execution Error: {str(e)}"
 
 
+def _read_proc_cpu_ticks() -> dict[int, int]:
+    """Return {pid: utime+stime clock ticks} for every process readable in /proc."""
+    ticks = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat") as f:
+                stat = f.read()
+            # The command name is in parentheses and may contain spaces; split after it.
+            fields = stat[stat.rindex(")") + 2:].split()
+            ticks[int(entry)] = int(fields[11]) + int(fields[12])  # utime + stime
+        except (OSError, ValueError, IndexError):
+            continue
+    return ticks
+
+
+def _proc_details(pid: int) -> tuple[str, str, str, int]:
+    """Return (user, command name, full command line, resident memory in kB) for a pid."""
+    with open(f"/proc/{pid}/comm") as f:
+        name = f.read().strip()
+    with open(f"/proc/{pid}/cmdline", "rb") as f:
+        cmdline = f.read().replace(b"\0", b" ").decode(errors="replace").strip()
+    uid, rss_kb = None, 0
+    with open(f"/proc/{pid}/status") as f:
+        for line in f:
+            if line.startswith("Uid:"):
+                uid = int(line.split()[1])
+            elif line.startswith("VmRSS:"):
+                rss_kb = int(line.split()[1])
+    try:
+        user = pwd.getpwuid(uid).pw_name if uid is not None else "?"
+    except KeyError:
+        user = str(uid)
+    return user, name, cmdline, rss_kb
+
+
 @mcp.tool()
 def list_top_processes(limit: int = 10) -> str:
     """
-    Lists the processes using the most CPU, with their memory usage.
+    Lists the processes using the most CPU, measured over a 1-second sample (not a lifetime average),
+    with their memory usage. AIDA's own diagnostic processes are excluded.
     """
     limit = max(1, min(int(limit), 25))
-    output = _run(["ps", "-eo", "pid,user,%cpu,%mem,comm", "--sort=-%cpu"])
-    return "\n".join(output.splitlines()[: limit + 1])
+    interval = 1.0
+    hz = os.sysconf("SC_CLK_TCK")
+    before = _read_proc_cpu_ticks()
+    time.sleep(interval)
+    after = _read_proc_cpu_ticks()
+
+    try:
+        with open("/proc/meminfo") as f:
+            mem_total_kb = int(next(l for l in f if l.startswith("MemTotal:")).split()[1])
+    except Exception:
+        mem_total_kb = 0
+
+    own_pid = os.getpid()
+    rows, excluded = [], 0
+    for pid, end_ticks in after.items():
+        if pid not in before:
+            continue  # started during the sample; no reliable measurement
+        cpu = (end_ticks - before[pid]) / hz / interval * 100
+        try:
+            user, name, cmdline, rss_kb = _proc_details(pid)
+        except (OSError, ValueError):
+            continue
+        # Skip AIDA's own tool processes so the agent doesn't diagnose itself
+        if pid == own_pid or "mcp_server.py" in cmdline:
+            excluded += 1
+            continue
+        mem = rss_kb / mem_total_kb * 100 if mem_total_kb else 0
+        rows.append((cpu, mem, pid, user, name))
+
+    rows.sort(reverse=True)
+    lines = [f"CPU measured over {interval:.0f}s on {os.cpu_count()} CPUs (100% = one full core).",
+             f"{'PID':>7}  {'USER':<12} {'%CPU':>6} {'%MEM':>6}  COMMAND"]
+    for cpu, mem, pid, user, name in rows[:limit]:
+        lines.append(f"{pid:>7}  {user:<12} {cpu:>6.1f} {mem:>6.1f}  {name}")
+    if excluded:
+        lines.append(f"({excluded} AIDA diagnostic process(es) excluded.)")
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
 # Security specialist tools (read-only)
 # ---------------------------------------------------------------------------
 
+def _describe_bind_address(address: str) -> str:
+    """Turn an ss bind address into plain words (also avoids '[::]' being read as Markdown)."""
+    host = address.strip("[]").split("%")[0]
+    if host in ("0.0.0.0",):
+        return "all IPv4 interfaces (reachable from other machines)"
+    if host in ("::", "*"):
+        return "all interfaces, IPv4 and IPv6 (reachable from other machines)"
+    if host.startswith("127.") or host == "::1":
+        return f"localhost only ({host})"
+    return f"specific address {host}"
+
+
 @mcp.tool()
 def list_listening_ports() -> str:
     """
-    Lists TCP and UDP ports the host is listening on, to spot unexpected exposed services.
+    Lists TCP and UDP ports the host is listening on, whether each is exposed to other machines
+    or bound to localhost only, and the owning process when visible.
     """
-    return _run(["ss", "-tuln"])
+    raw = _run(["ss", "-tulnpH"])
+    if raw.startswith(("Command", "Timeout", "Execution Error")):
+        return raw
+
+    entries = set()
+    for line in raw.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        proto, local = parts[0], parts[4]
+        address, _, port = local.rpartition(":")
+        match = re.search(r'users:\(\("([^"]+)"', line)
+        process = match.group(1) if match else "unknown (owned by another user)"
+        entries.add((int(port) if port.isdigit() else 0, proto, _describe_bind_address(address), process))
+
+    if not entries:
+        return "No listening ports found."
+    lines = ["PROTO  PORT   PROCESS                          LISTENING ON"]
+    for port, proto, where, process in sorted(entries):
+        lines.append(f"{proto:<6} {port:<6} {process:<32} {where}")
+    return "\n".join(lines)
 
 
 @mcp.tool()

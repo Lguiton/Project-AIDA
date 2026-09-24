@@ -10,6 +10,7 @@ async def security_specialist_node(state: AidaState, llm, tools) -> dict:
         "real evidence from the host before drawing conclusions. "
         "Report what you found, flag anything that looks unusual and explain why, and recommend next steps. "
         "If the evidence suggests an active compromise, say clearly that the ticket should be escalated to a human. "
+        "Write every IP address, port and process name inside backticks, e.g. `0.0.0.0:8000`. "
         "Do not claim to have changed anything on the system."
     )
     prompt = ChatPromptTemplate.from_messages([("system", system_prompt), ("placeholder", "{messages}")])

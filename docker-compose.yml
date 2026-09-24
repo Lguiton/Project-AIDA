@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: aida_password
       POSTGRES_DB: aida_kb
     ports:
-      - "55432:5432"
+      # Bound to localhost only, so the database is not reachable from other machines
+      - "127.0.0.1:55432:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
 

@@ -4,8 +4,10 @@ import pwd
 import re
 import time
 import shutil
+import stat as _stat
 import socket
 import subprocess
+import tempfile
 
 try:
     # MCP SDK v2.x
@@ -221,6 +223,22 @@ def list_top_processes(limit: int = 10) -> str:
     return "\n".join(lines)
 
 
+_SERVICE_NAME = re.compile(r"^[A-Za-z0-9@._-]{1,100}$")
+
+
+@mcp.tool()
+def check_service_status(service_name: str) -> str:
+    """
+    Shows whether a systemd service is running, with its most recent log lines.
+    Read-only; use it before recommending a service restart.
+    """
+    if not _SERVICE_NAME.match(service_name or ""):
+        return f"Invalid service name: {service_name!r}"
+    state = _run(["systemctl", "is-active", service_name])
+    details = _run(["systemctl", "status", "--no-pager", "--lines=5", service_name], timeout=10)
+    return f"{service_name} is {state}\n\n{details}"
+
+
 # ---------------------------------------------------------------------------
 # Security specialist tools (read-only)
 # ---------------------------------------------------------------------------
@@ -342,6 +360,74 @@ def flush_dns_cache() -> str:
     else:
         header = "FAILED: no DNS cache was flushed."
     return header + "\n" + "\n".join(lines)
+
+
+def _restartable_services() -> set[str]:
+    """Services AIDA may restart. Set AIDA_RESTARTABLE_SERVICES in .env (comma-separated) to change."""
+    raw = os.getenv("AIDA_RESTARTABLE_SERVICES", "cron,ssh,systemd-resolved,docker")
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+@mcp.tool()
+def restart_service(service_name: str) -> str:
+    """
+    Restarts a systemd service, then checks that it came back up. Changes system state, so it only
+    runs after a human approves it. Only services on AIDA's allowlist can be restarted.
+    """
+    allowed = _restartable_services()
+    if not _SERVICE_NAME.match(service_name or "") or service_name not in allowed:
+        return (f"REFUSED: {service_name!r} is not on the restart allowlist ({', '.join(sorted(allowed))}). "
+                f"Nothing was restarted. Add it to AIDA_RESTARTABLE_SERVICES in .env to allow it.")
+
+    ok, output = _run_status(["systemctl", "restart", service_name], timeout=30)
+    how = "systemctl"
+    if not ok:
+        ok, sudo_output = _run_status(["sudo", "-n", "systemctl", "restart", service_name], timeout=30)
+        how = "sudo systemctl"
+        if not ok:
+            return (f"FAILED: could not restart {service_name}. {output or 'permission denied'}; "
+                    f"sudo without password not allowed ({sudo_output or 'no output'}). To allow it, add this "
+                    f"sudoers rule with 'sudo visudo -f /etc/sudoers.d/aida': "
+                    f"<your-user> ALL=(root) NOPASSWD: /usr/bin/systemctl restart {service_name}")
+
+    time.sleep(1)
+    state = _run(["systemctl", "is-active", service_name])
+    if state.strip() == "active":
+        return f"SUCCESS: restarted {service_name} with {how}; it is now active."
+    return f"WARNING: restart command for {service_name} succeeded, but the service is now '{state.strip()}'."
+
+
+@mcp.tool()
+def clear_temp_files(older_than_days: int = 7) -> str:
+    """
+    Deletes this user's own regular files in the temp directory that have not been modified for
+    older_than_days days (minimum 1). Never follows symlinks and never touches other users' files.
+    Changes system state, so it only runs after a human approves it.
+    """
+    days = max(1, int(older_than_days))
+    base = os.getenv("AIDA_TEMP_DIR") or tempfile.gettempdir()
+    cutoff = time.time() - days * 86400
+    uid = os.getuid()
+    deleted, freed, skipped_errors = 0, 0, 0
+
+    for root, dirs, files in os.walk(base, followlinks=False):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                st = os.lstat(path)
+                if not _stat.S_ISREG(st.st_mode) or st.st_uid != uid or st.st_mtime > cutoff:
+                    continue
+                os.unlink(path)
+                deleted += 1
+                freed += st.st_size
+            except OSError:
+                skipped_errors += 1
+
+    size = f"{freed / 1024 / 1024:.1f} MB" if freed >= 1024 * 1024 else f"{freed / 1024:.1f} KB"
+    result = f"SUCCESS: deleted {deleted} file(s) older than {days} day(s) from {base}, freeing {size}."
+    if skipped_errors:
+        result += f" {skipped_errors} file(s) could not be removed and were skipped."
+    return result
 
 
 if __name__ == "__main__":

@@ -5,8 +5,7 @@ from langchain_core.documents import Document
 
 load_dotenv()
 
-CONNECTION_STRING = "postgresql+psycopg://aida:aida_password@localhost:55432/aida_kb"
-COLLECTION_NAME = "historical_tickets"
+from src.db import KB_COLLECTION as COLLECTION_NAME, SQLALCHEMY_URI as CONNECTION_STRING
 
 def seed_database():
     print("Initializing pgvector database...")
@@ -38,7 +37,8 @@ def seed_database():
     ]
     
     print(f"Adding {len(docs)} historical tickets to pgvector...")
-    vector_store.add_documents(docs)
+    # Fixed ids so running setup again updates the seed tickets instead of duplicating them
+    vector_store.add_documents(docs, ids=[f"seed-{d.metadata['ticket_id']}" for d in docs])
     print("Seeding complete.")
 
 if __name__ == "__main__":

@@ -1,3 +1,4 @@
+import hmac
 import os
 import time
 from datetime import datetime, timezone
@@ -5,12 +6,49 @@ from zoneinfo import ZoneInfo
 
 import requests
 import streamlit as st
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # API Configuration
 API_BASE = "http://127.0.0.1:8006/api"
 API_URL = f"{API_BASE}/tickets"
+# Shared key the backend requires on every /api call (AIDA_API_KEY in .env)
+API_HEADERS = {"X-AIDA-Key": os.getenv("AIDA_API_KEY", "")}
 
 st.set_page_config(page_title="Eivanta Labs | Project AIDA", layout="wide")
+
+
+def require_login():
+    """Operator login. The password is AIDA_UI_PASSWORD in .env; the page stops here until it is entered."""
+    password = os.getenv("AIDA_UI_PASSWORD", "")
+    if not password:
+        st.error("AIDA_UI_PASSWORD is not set. Add it to .env and restart Streamlit.")
+        st.stop()
+    if st.session_state.get("authenticated"):
+        return
+
+    st.title("🛡️ Project AIDA Command Center")
+    with st.form("login_form"):
+        entered = st.text_input("Operator password", type="password")
+        submitted = st.form_submit_button("Sign in")
+    if submitted:
+        if hmac.compare_digest(entered.encode(), password.encode()):
+            st.session_state.authenticated = True
+            st.rerun()
+        time.sleep(1)  # slow down password guessing
+        st.error("Incorrect password.")
+    st.stop()
+
+
+require_login()
+
+with st.sidebar:
+    if st.button("Sign out"):
+        st.session_state.authenticated = False
+        st.rerun()
+    if not API_HEADERS["X-AIDA-Key"]:
+        st.warning("AIDA_API_KEY is not set in .env, so the backend will reject requests.")
 
 # Timestamps are stored in UTC; show them in this time zone (override with AIDA_TIMEZONE in .env)
 try:
@@ -36,7 +74,7 @@ def format_timestamp(value):
 def fetch_tickets():
     """Tickets come from the backend (Postgres), so they survive restarts of either app."""
     try:
-        response = requests.get(API_URL, params={"limit": 50}, timeout=10)
+        response = requests.get(API_URL, params={"limit": 50}, headers=API_HEADERS, timeout=10)
         response.raise_for_status()
         return response.json()
     except Exception as e:
@@ -46,7 +84,7 @@ def fetch_tickets():
 
 def fetch_metrics():
     try:
-        response = requests.get(f"{API_BASE}/metrics", timeout=10)
+        response = requests.get(f"{API_BASE}/metrics", headers=API_HEADERS, timeout=10)
         response.raise_for_status()
         return response.json()
     except Exception:
@@ -55,7 +93,7 @@ def fetch_metrics():
 
 def submit_ticket(issue_text):
     try:
-        response = requests.post(API_URL, json={"issue": issue_text}, timeout=300)
+        response = requests.post(API_URL, json={"issue": issue_text}, headers=API_HEADERS, timeout=300)
         if response.status_code == 200:
             return True
         st.error(f"Backend returned {response.status_code}: {response.text}")
@@ -64,11 +102,21 @@ def submit_ticket(issue_text):
     return False
 
 
+def forget_ticket(thread_id):
+    """Take a ticket's answer out of the knowledge base (for answers that should not be reused)."""
+    try:
+        response = requests.post(f"{API_URL}/{thread_id}/forget", headers=API_HEADERS, timeout=30)
+        if response.status_code != 200:
+            st.error(f"Could not remove ticket from the knowledge base ({response.status_code}): {response.text}")
+    except Exception as e:
+        st.error(f"Could not remove ticket from the knowledge base: {e}")
+
+
 def decide_ticket(thread_id, approved):
     """Send the operator's decision on a pending remediation (approve runs it, deny closes the ticket)."""
     action = "Approval" if approved else "Denial"
     try:
-        response = requests.post(f"{API_URL}/{thread_id}/approve", json={"approved": approved}, timeout=300)
+        response = requests.post(f"{API_URL}/{thread_id}/approve", json={"approved": approved}, headers=API_HEADERS, timeout=300)
         if response.status_code == 200:
             if approved:
                 st.success(f"Ticket {thread_id[:8]} approved and executed.")
@@ -121,6 +169,11 @@ with right_pane:
                 st.markdown(f"**Issue:** {ticket.get('issue')}")
                 st.markdown(f"**Status:** `{ticket.get('status')}`")
                 st.markdown(f"**Agent Response:**\n{ticket.get('last_message') or ''}")
+                if ticket.get("learned"):
+                    st.caption("📚 Added to the knowledge base for future tickets.")
+                    if st.button("Remove from knowledge base", key=f"forget_{thread_id}"):
+                        forget_ticket(thread_id)
+                        st.rerun()
 
                 # Human-in-the-Loop Gateway
                 if ticket.get("requires_approval"):
@@ -151,7 +204,10 @@ with kpi_area:
             tickets_delta += f", {metrics['tickets_denied']} denied"
         col2.metric("Tickets", str(metrics["tickets_total"]), tickets_delta, delta_color="off")
         if metrics["kb_online"]:
-            col3.metric("Vector DB", "Online", f"{metrics['kb_records']} Records")
+            kb_delta = f"{metrics['kb_records']} Records"
+            if metrics.get("tickets_learned"):
+                kb_delta += f" ({metrics['tickets_learned']} learned)"
+            col3.metric("Vector DB", "Online", kb_delta, help="Seeded tickets plus tickets AIDA resolved and learned from")
         else:
             col3.metric("Vector DB", "Not seeded", "Run src/kb/setup.py", delta_color="off")
 

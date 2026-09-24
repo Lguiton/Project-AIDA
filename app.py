@@ -1,12 +1,36 @@
-import streamlit as st
-import requests
+import os
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+import requests
+import streamlit as st
 
 # API Configuration
 API_BASE = "http://127.0.0.1:8006/api"
 API_URL = f"{API_BASE}/tickets"
 
 st.set_page_config(page_title="Eivanta Labs | Project AIDA", layout="wide")
+
+# Timestamps are stored in UTC; show them in this time zone (override with AIDA_TIMEZONE in .env)
+try:
+    DISPLAY_TZ = ZoneInfo(os.getenv("AIDA_TIMEZONE", "America/Los_Angeles"))
+except Exception:
+    DISPLAY_TZ = None  # fall back to the machine's local time zone
+
+
+def format_timestamp(value):
+    """Convert an ISO timestamp from the API (UTC) to readable local time, e.g. 'Sep 23, 5:08 PM PDT'."""
+    if not value:
+        return ""
+    try:
+        dt = datetime.fromisoformat(value)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local = dt.astimezone(DISPLAY_TZ) if DISPLAY_TZ else dt.astimezone()
+        return f"{local:%b} {local.day}, {local.hour % 12 or 12}:{local:%M %p %Z}"
+    except ValueError:
+        return value
 
 
 def fetch_tickets():
@@ -85,7 +109,7 @@ with right_pane:
     else:
         for ticket in tickets:
             thread_id = ticket["thread_id"]
-            created = (ticket.get("created_at") or "")[:16].replace("T", " ")
+            created = format_timestamp(ticket.get("created_at"))
             specialist = (ticket.get("current_specialist") or "unknown").upper()
             is_open = ticket.get("status") != "resolved" or ticket.get("requires_approval")
             with st.expander(f"Ticket {thread_id[:8]} - Specialist: {specialist} - {created}", expanded=bool(is_open)):

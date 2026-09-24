@@ -14,6 +14,8 @@ Settings (.env):
   AIDA_MONITOR_LOAD_FACTOR   alert when 5-minute load > CPUs x this (default 2.0)
   AIDA_MONITOR_CERT_HOSTS    comma-separated host[:port] whose TLS certificates to watch (default none)
   AIDA_MONITOR_CERT_DAYS     alert when a certificate expires within this many days (default 14)
+  AIDA_MONITOR_FAILED_LOGINS alert when one IP fails this many logins in the window (default 20)
+  AIDA_MONITOR_LOGIN_WINDOW_HOURS  window for failed-login counting (default 1)
 """
 import asyncio
 import os
@@ -157,9 +159,28 @@ def check_certificates(hosts: list[str] | None = None, days: float | None = None
     return alerts
 
 
+def check_failed_logins(threshold: float | None = None, hours: float | None = None, counter=None) -> list[Alert]:
+    """Password-guessing detection: one ticket per attacking IP, asking to block it (approval required)."""
+    threshold = threshold if threshold is not None else _env_float("AIDA_MONITOR_FAILED_LOGINS", 20)
+    hours = hours if hours is not None else _env_float("AIDA_MONITOR_LOGIN_WINDOW_HOURS", 1)
+    if counter is None:
+        import mcp_server  # shares the log parsing used by the security tools
+        counter = lambda h: mcp_server._failed_logins(max(1, int(round(h))))[0]
+    alerts = []
+    for ip, count in counter(hours).most_common():
+        if count < threshold:
+            break
+        alerts.append(Alert(
+            key=f"attack:{ip}", check="failed_logins",
+            issue=f"{AUTO_PREFIX} Possible password-guessing attack: {count} failed login attempts from {ip} "
+                  f"in the last {hours:g} hour(s). Block the IP address {ip}.",
+        ))
+    return alerts
+
+
 def collect_alerts() -> list[Alert]:
     alerts: list[Alert] = []
-    for check in (check_disks, check_memory, check_load, check_failed_services, check_certificates):
+    for check in (check_disks, check_memory, check_load, check_failed_services, check_certificates, check_failed_logins):
         try:
             alerts.extend(check())
         except Exception as e:  # one broken check must not stop the others

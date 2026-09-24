@@ -9,7 +9,7 @@ MAX_RESOLUTION_CHARS = 4000
 
 
 # Tools whose output is a point-in-time report about this machine, not a reusable fix
-SNAPSHOT_ONLY_TOOLS = {"security_audit"}
+SNAPSHOT_ONLY_TOOLS = {"security_audit", "scan_vulnerabilities", "compliance_check"}
 
 
 def should_learn(status: str | None, specialist: str | None, resolution: str | None,

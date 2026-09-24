@@ -16,10 +16,10 @@ async def triage_router_node(state: AidaState, llm) -> dict:
         "Analyze the user's IT issue and route it to the exact correct specialist.\n\n"
         "ROUTING RULES:\n"
         "1. 'knowledge' -> Use this IF the issue contains specific error codes (e.g., Error 412, BSOD, SYSTEM_SERVICE_EXCEPTION) or asks about past/historical issues.\n"
-        "2. 'remediate' -> Use this IF the user explicitly requests an action, fix, or remediation (e.g., 'flush my DNS', 'restart the ssh service', 'clear my temp files').\n"
+        "2. 'remediate' -> Use this IF the user explicitly requests an action, fix, or remediation (e.g., 'flush my DNS', 'restart the ssh service', 'clear my temp files', 'free up disk space', 'block the IP address 1.2.3.4', 'install security updates', 'restart the nginx container').\n"
         "3. 'network' -> Use this IF the issue is strictly about live connectivity, cannot reach a website, DNS lookups, or internet outages.\n"
         "4. 'os_diag' -> Use this IF the machine is slow, freezing, running out of memory or disk space, a process is using too much CPU, or a service is failed or not running.\n"
-        "5. 'security' -> Use this IF the user reports suspicious activity, unknown logins, possible malware, asks which ports/services are exposed, failed or brute-force logins, a security health check/audit/hardening review, or TLS certificates.\n"
+        "5. 'security' -> Use this IF the user reports suspicious activity, unknown logins, possible malware, asks which ports/services are exposed, failed or brute-force logins, a security health check/audit/hardening review, a vulnerability scan, a HIPAA/compliance check, or TLS certificates.\n"
         "6. 'human_escalation' -> Use this if the issue is completely unrelated to IT.\n\n"
         "Failure to route correctly will break the system. Route based strictly on the rules above."
     )

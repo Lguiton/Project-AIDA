@@ -9,6 +9,8 @@ import socket
 import glob
 from collections import Counter
 import subprocess
+import sys
+import json
 import tempfile
 
 try:
@@ -662,6 +664,411 @@ def clear_temp_files(older_than_days: int = 7) -> str:
     if skipped_errors:
         result += f" {skipped_errors} file(s) could not be removed and were skipped."
     return result
+
+
+# ---------------------------------------------------------------------------
+# More fixes (approval-gated): privileged helper, logs, Docker, firewall, updates
+# ---------------------------------------------------------------------------
+
+def _run_privileged(cmd: list[str], timeout: int = 120) -> tuple[bool, str, str]:
+    """Run a command that needs root: try directly, then `sudo -n` (never prompts). Returns (ok, output, how)."""
+    ok, output = _run_status(cmd, timeout=timeout)
+    if ok:
+        return True, output, "directly"
+    ok, sudo_output = _run_status(["sudo", "-n", *cmd], timeout=timeout)
+    if ok:
+        return True, sudo_output, "with sudo"
+    return False, f"{output or 'permission denied'}; sudo without password not allowed ({sudo_output or 'no output'})", ""
+
+
+def _sudoers_hint(command: str) -> str:
+    return (f"To allow it, add this line with 'sudo visudo -f /etc/sudoers.d/aida': "
+            f"<your-user> ALL=(root) NOPASSWD: {command}")
+
+
+@mcp.tool()
+def rotate_logs() -> str:
+    """
+    Forces log rotation (logrotate) so large log files are compressed and old ones removed, freeing disk
+    space. Changes system state, so it only runs after a human approves it.
+    """
+    if not shutil.which("logrotate"):
+        return "FAILED: logrotate is not installed on this machine."
+    ok, output, how = _run_privileged(["logrotate", "-f", "/etc/logrotate.conf"], timeout=300)
+    if ok:
+        return f"SUCCESS: rotated logs {how}." + (f"\n{output[:500]}" if output and output != "(no output)" else "")
+    return f"FAILED: could not rotate logs. {output}. {_sudoers_hint('/usr/sbin/logrotate -f /etc/logrotate.conf')}"
+
+
+@mcp.tool()
+def docker_prune() -> str:
+    """
+    Frees disk space used by Docker: removes stopped containers, dangling images, unused networks and build
+    cache. Does NOT remove volumes (your data) or images used by any container. Only runs after approval.
+    """
+    if not shutil.which("docker"):
+        return "FAILED: Docker is not installed or not on the PATH."
+    ok, output = _run_status(["docker", "system", "prune", "-f"], timeout=600)
+    if not ok:
+        return f"FAILED: docker prune did not run: {output[:500]}"
+    reclaimed = re.search(r"Total reclaimed space:\s*(.+)", output)
+    return f"SUCCESS: Docker cleanup finished. Reclaimed {reclaimed.group(1).strip() if reclaimed else 'an unknown amount of'} space."
+
+
+@mcp.tool()
+def restart_container(container_name: str) -> str:
+    """
+    Restarts a Docker container by name, then checks it is running again. Only runs after approval.
+    """
+    if not re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", container_name or ""):
+        return f"REFUSED: {container_name!r} is not a valid container name. Nothing was restarted."
+    if not shutil.which("docker"):
+        return "FAILED: Docker is not installed or not on the PATH."
+    ok, names = _run_status(["docker", "ps", "-a", "--format", "{{.Names}}"], timeout=30)
+    if not ok:
+        return f"FAILED: could not list containers: {names[:300]}"
+    if container_name not in names.split():
+        return f"REFUSED: no container named {container_name!r}. Existing containers: {', '.join(names.split()[:20]) or 'none'}."
+    ok, output = _run_status(["docker", "restart", container_name], timeout=120)
+    if not ok:
+        return f"FAILED: could not restart {container_name}: {output[:300]}"
+    _ok, state = _run_status(["docker", "inspect", "-f", "{{.State.Status}}", container_name], timeout=30)
+    if state.strip() == "running":
+        return f"SUCCESS: restarted container {container_name}; it is running."
+    return f"WARNING: restart command succeeded, but {container_name} is now '{state.strip()}'."
+
+
+def _this_hosts_addresses() -> set[str]:
+    ok, output = _run_status(["hostname", "-I"], timeout=5)
+    return set(output.split()) if ok else set()
+
+
+def _check_block_target(ip: str) -> tuple[str | None, str]:
+    """Validate an address to block. Returns (error, normalised address)."""
+    import ipaddress
+    try:
+        address = ipaddress.ip_address((ip or "").strip())
+    except ValueError:
+        return f"REFUSED: {ip!r} is not a valid IP address. Nothing was blocked.", ""
+    if address.is_loopback or address.is_unspecified or address.is_multicast:
+        return f"REFUSED: {address} is a loopback/unspecified/multicast address and must not be blocked.", ""
+    if str(address) in _this_hosts_addresses():
+        return f"REFUSED: {address} is one of this machine's own addresses; blocking it would cut off access.", ""
+    return None, str(address)
+
+
+@mcp.tool()
+def block_ip(ip_address: str) -> str:
+    """
+    Blocks all incoming traffic from one IP address in the host firewall (ufw if installed, otherwise
+    iptables). Use it against addresses that are guessing passwords or attacking the machine.
+    Only runs after a human approves it. Loopback and this machine's own addresses are refused.
+    """
+    error, address = _check_block_target(ip_address)
+    if error:
+        return error
+    if shutil.which("ufw"):
+        cmd, hint = ["ufw", "insert", "1", "deny", "from", address], f"/usr/sbin/ufw insert 1 deny from {address}"
+    elif shutil.which("iptables"):
+        flag = "ip6tables" if ":" in address else "iptables"
+        cmd, hint = [flag, "-I", "INPUT", "-s", address, "-j", "DROP"], f"/usr/sbin/{flag} -I INPUT -s {address} -j DROP"
+    else:
+        return "FAILED: no firewall tool (ufw or iptables) is installed."
+    ok, output, how = _run_privileged(cmd, timeout=30)
+    if ok:
+        note = " Note: ufw rules only take effect while ufw is enabled." if cmd[0] == "ufw" else ""
+        return f"SUCCESS: blocked incoming traffic from {address} using {cmd[0]} ({how}).{note}"
+    return f"FAILED: could not block {address}. {output}. {_sudoers_hint(hint)}"
+
+
+@mcp.tool()
+def unblock_ip(ip_address: str) -> str:
+    """
+    Removes a firewall block for one IP address that was added with block_ip. Only runs after approval.
+    """
+    import ipaddress
+    try:
+        address = str(ipaddress.ip_address((ip_address or "").strip()))
+    except ValueError:
+        return f"REFUSED: {ip_address!r} is not a valid IP address."
+    if shutil.which("ufw"):
+        cmd = ["ufw", "delete", "deny", "from", address]
+    elif shutil.which("iptables"):
+        cmd = ["ip6tables" if ":" in address else "iptables", "-D", "INPUT", "-s", address, "-j", "DROP"]
+    else:
+        return "FAILED: no firewall tool (ufw or iptables) is installed."
+    ok, output, how = _run_privileged(cmd, timeout=30)
+    return (f"SUCCESS: removed the block on {address} ({how})." if ok
+            else f"FAILED: could not unblock {address}. {output}")
+
+
+_PACKAGE_NAME = re.compile(r"^[a-z0-9][a-z0-9+.\-]{0,127}$")
+
+
+def _pending_security_packages() -> list[str] | str:
+    ok, output = _run_status(["apt", "list", "--upgradable"], timeout=60)
+    if not ok:
+        return f"apt is not available: {output[:200]}"
+    return sorted({l.split("/")[0] for l in output.splitlines() if "/" in l and "-security" in l})
+
+
+@mcp.tool()
+def scan_vulnerabilities() -> str:
+    """
+    Read-only vulnerability scan: operating-system packages with pending security updates, and Python
+    packages in AIDA's own environment with known vulnerabilities (via pip-audit, if installed).
+    """
+    lines = []
+    security = _pending_security_packages()
+    if isinstance(security, str):
+        lines.append(f"OS packages: skipped ({security}).")
+    elif security:
+        lines.append(f"OS packages: {len(security)} with pending SECURITY updates: {', '.join(security[:30])}"
+                     + (" ..." if len(security) > 30 else ""))
+    else:
+        lines.append("OS packages: no pending security updates (as of the last 'apt update').")
+
+    ok, output = _run_status([sys.executable, "-m", "pip_audit", "--format", "json", "--progress-spinner", "off"], timeout=300)
+    if "No module named pip_audit" in output:
+        lines.append("Python packages: skipped (install pip-audit with 'pip install pip-audit' to enable).")
+    else:
+        try:
+            start = output.index("{")
+            report = json.loads(output[start:output.rindex("}") + 1])
+            vulnerable = [d for d in report.get("dependencies", []) if d.get("vulns")]
+            if vulnerable:
+                lines.append(f"Python packages: {len(vulnerable)} with known vulnerabilities:")
+                for dep in vulnerable[:20]:
+                    ids = ", ".join(v["id"] for v in dep["vulns"][:3])
+                    fixes = sorted({f for v in dep["vulns"] for f in v.get("fix_versions", [])})
+                    lines.append(f"  {dep['name']} {dep['version']}: {ids}"
+                                 + (f" (fixed in {', '.join(fixes[:3])})" if fixes else " (no fix yet)"))
+            else:
+                lines.append(f"Python packages: no known vulnerabilities in {len(report.get('dependencies', []))} packages.")
+        except (ValueError, KeyError):
+            lines.append(f"Python packages: pip-audit could not complete: {output[-300:]}")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def install_security_updates() -> str:
+    """
+    Installs pending operating-system SECURITY updates only (apt). Only runs after a human approves it.
+    """
+    packages = _pending_security_packages()
+    if isinstance(packages, str):
+        return f"FAILED: {packages}"
+    if not packages:
+        return "SUCCESS: no security updates were pending; nothing to install."
+    packages = [p for p in packages if _PACKAGE_NAME.match(p)]
+    ok, output, how = _run_privileged(["apt-get", "install", "-y", "--only-upgrade", *packages], timeout=1800)
+    if ok:
+        return f"SUCCESS: installed security updates for {len(packages)} package(s) {how}: {', '.join(packages[:30])}"
+    return (f"FAILED: security updates were not installed. {output[-500:]}. "
+            f"{_sudoers_hint('/usr/bin/apt-get install -y --only-upgrade *')}")
+
+
+# ---------------------------------------------------------------------------
+# Runbooks: several steps, one approval
+# ---------------------------------------------------------------------------
+
+RUNBOOKS: dict[str, dict] = {
+    "disk_cleanup": {
+        "description": "Free disk space: clear old temp files, rotate logs, prune unused Docker data, then re-check space.",
+        "steps": [("check_disk_usage", {"path": "/"}), ("clear_temp_files", {"older_than_days": 7}),
+                  ("rotate_logs", {}), ("docker_prune", {}), ("check_disk_usage", {"path": "/"})],
+    },
+    "network_reset": {
+        "description": "Fix name-resolution problems: flush DNS caches, then verify DNS and internet reachability.",
+        "steps": [("flush_dns_cache", {}), ("resolve_dns", {"hostname": "google.com"}), ("ping_host", {"hostname": "8.8.8.8"})],
+    },
+    "security_patch": {
+        "description": "Install pending security updates, then re-run the security health check.",
+        "steps": [("install_security_updates", {}), ("security_audit", {})],
+    },
+}
+
+
+def run_runbook_steps(name: str, step_functions: dict | None = None) -> str:
+    runbook = RUNBOOKS.get(name)
+    if not runbook:
+        return f"REFUSED: unknown runbook {name!r}. Available: {', '.join(RUNBOOKS)}."
+    functions = step_functions or globals()
+    lines, failed_at = [], None
+    for number, (tool, args) in enumerate(runbook["steps"], start=1):
+        try:
+            result = str(functions[tool](**args))
+        except Exception as e:
+            result = f"FAILED: {e}"
+        first = result.strip().splitlines()[0] if result.strip() else "(no output)"
+        lines.append(f"Step {number} {tool}{' ' + json.dumps(args) if args else ''}: {first[:300]}")
+        if result.startswith(("FAILED", "REFUSED")):
+            failed_at = number
+            break
+    total = len(runbook["steps"])
+    if failed_at:
+        header = f"FAILED: runbook {name} stopped at step {failed_at} of {total}."
+    else:
+        header = f"SUCCESS: runbook {name} completed all {total} steps."
+    return header + "\n" + "\n".join(lines)
+
+
+@mcp.tool()
+def run_runbook(name: str) -> str:
+    """Runs a named runbook (several fix steps under ONE approval); stops at the first failed step."""
+    return run_runbook_steps(name)
+
+
+# The agent picks a runbook from this description, so list them there
+run_runbook.__doc__ = ("Runs a named runbook: several fix steps approved once, stopping at the first failure. "
+                       "Available runbooks: " + "; ".join(f"'{k}': {v['description']}" for k, v in RUNBOOKS.items()))
+try:  # keep the registered MCP tool description in sync (SDK versions differ in where it is stored)
+    for registry in (getattr(getattr(mcp, "_tool_manager", None), "_tools", {}),):
+        if "run_runbook" in registry:
+            registry["run_runbook"].description = run_runbook.__doc__
+except Exception:
+    pass
+
+
+# ---------------------------------------------------------------------------
+# HIPAA-oriented technical safeguards self-check (read-only)
+# ---------------------------------------------------------------------------
+
+def _read(path: str) -> str:
+    try:
+        with open(path, errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def run_compliance_checks() -> list[dict]:
+    """Technical checks mapped to HIPAA Security Rule safeguards. status: pass | fail | unknown."""
+    checks = []
+
+    def add(safeguard, citation, status, detail, fix=""):
+        checks.append({"safeguard": safeguard, "citation": citation, "status": status, "detail": detail, "fix": fix})
+
+    on_wsl = "microsoft" in _read("/proc/version").lower()
+
+    # Encryption at rest
+    ok, output = _run_status(["lsblk", "-n", "-o", "TYPE"], timeout=10)
+    if ok and "crypt" in output.split():
+        add("Encryption at rest", "164.312(a)(2)(iv)", "pass", "An encrypted (LUKS) volume is in use.")
+    elif on_wsl:
+        add("Encryption at rest", "164.312(a)(2)(iv)", "unknown",
+            "Running under WSL: disk encryption is controlled by Windows (BitLocker) and cannot be read from here.",
+            "Confirm BitLocker is on in Windows Settings > Privacy & security > Device encryption.")
+    else:
+        add("Encryption at rest", "164.312(a)(2)(iv)", "fail", "No encrypted volume found.",
+            "Encrypt disks that store patient data (LUKS / full-disk encryption).")
+
+    no_systemd = "systemd is not running here (on WSL, enable it with systemd=true in /etc/wsl.conf)"
+
+    # Audit controls
+    ok, output = _run_status(["systemctl", "is-active", "auditd"], timeout=10)
+    if "not been booted with systemd" in output or "Failed to connect to bus" in output:
+        add("System audit logging (auditd)", "164.312(b)", "unknown", f"Cannot check auditd: {no_systemd}.")
+    else:
+        state = output.strip().splitlines()[0] if output.strip() else "not installed"
+        add("System audit logging (auditd)", "164.312(b)", "pass" if state == "active" else "fail",
+            f"auditd is {state}.",
+            "" if state == "active" else "Install and enable auditd: 'sudo apt install auditd && sudo systemctl enable --now auditd'.")
+
+    # Automatic logoff
+    profile_text = "".join(_read(p) for p in ["/etc/profile", "/etc/bash.bashrc", *glob.glob("/etc/profile.d/*.sh")])
+    tmout = re.search(r"^\s*(?:readonly\s+|export\s+)*TMOUT=(\d+)", profile_text, re.M)
+    if tmout and 0 < int(tmout.group(1)) <= 900:
+        add("Automatic logoff (shell sessions)", "164.312(a)(2)(iii)", "pass", f"Idle shells close after {tmout.group(1)} seconds.")
+    else:
+        add("Automatic logoff (shell sessions)", "164.312(a)(2)(iii)", "fail", "Idle terminal sessions never time out.",
+            "Add 'readonly TMOUT=900; export TMOUT' to /etc/profile.d/autologout.sh.")
+
+    # Password management
+    defs = _read("/etc/login.defs")
+    max_days = re.search(r"^\s*PASS_MAX_DAYS\s+(\d+)", defs, re.M)
+    pwquality = _read("/etc/security/pwquality.conf")
+    minlen = re.search(r"^\s*minlen\s*=\s*(\d+)", pwquality, re.M)
+    problems = []
+    if not max_days or int(max_days.group(1)) > 90:
+        problems.append(f"password expiry is {max_days.group(1) if max_days else 'not set'} days (recommended 90 or less)")
+    if not minlen or int(minlen.group(1)) < 12:
+        problems.append(f"minimum length is {minlen.group(1) if minlen else 'not enforced'} (recommended 12+)")
+    add("Password management", "164.308(a)(5)(ii)(D)", "fail" if problems else "pass",
+        "; ".join(problems) or "Password expiry and length rules are set.",
+        "Set PASS_MAX_DAYS 90 in /etc/login.defs and minlen = 12 in /etc/security/pwquality.conf (libpam-pwquality)." if problems else "")
+
+    # Protection from malicious software / patching
+    security = _pending_security_packages()
+    auto = _read("/etc/apt/apt.conf.d/20auto-upgrades")
+    auto_on = 'Unattended-Upgrade "1"' in auto
+    if isinstance(security, str):
+        add("Security patching", "164.308(a)(5)(ii)(B)", "unknown", security)
+    else:
+        status = "pass" if not security and auto_on else "fail"
+        detail = (f"{len(security)} security update(s) pending" if security else "No security updates pending") + \
+                 (", automatic security updates are ON." if auto_on else ", automatic security updates are OFF.")
+        add("Security patching", "164.308(a)(5)(ii)(B)", status, detail,
+            "" if status == "pass" else "Install pending updates and run 'sudo dpkg-reconfigure -plow unattended-upgrades'.")
+
+    # Transmission security / access
+    settings = _sshd_settings()
+    if settings is None:
+        add("Remote access (SSH)", "164.312(e)(1)", "pass", "No SSH server installed.")
+    else:
+        weak = settings.get("passwordauthentication", "yes") == "yes" or settings.get("permitrootlogin") == "yes"
+        add("Remote access (SSH)", "164.312(e)(1)", "fail" if weak else "pass",
+            f"PasswordAuthentication {settings.get('passwordauthentication', 'yes')}, PermitRootLogin {settings.get('permitrootlogin', 'prohibit-password')}.",
+            "Use key-based SSH only and disable root login." if weak else "")
+
+    ok, output = _run_status(["ufw", "status"], timeout=5)
+    if ok:
+        active = "inactive" not in output.lower()
+        add("Host firewall", "164.312(e)(1)", "pass" if active else "fail", output.splitlines()[0] if output else "",
+            "" if active else "Enable ufw after allowing required ports.")
+    else:
+        add("Host firewall", "164.312(e)(1)", "unknown",
+            "ufw not installed or needs root." + (" Under WSL the Windows firewall applies." if on_wsl else ""))
+
+    # Unique user identification
+    try:
+        uid0 = [l.split(":")[0] for l in _read("/etc/passwd").splitlines() if l.count(":") >= 6 and l.split(":")[2] == "0"]
+    except IndexError:
+        uid0 = []
+    add("Unique user identification", "164.312(a)(2)(i)", "fail" if len(uid0) > 1 else "pass",
+        "Only root has UID 0." if len(uid0) <= 1 else f"Shared admin identities: {', '.join(uid0)}",
+        "" if len(uid0) <= 1 else "Give every person their own account.")
+
+    # Time synchronisation (needed for trustworthy audit timestamps)
+    ok, output = _run_status(["timedatectl", "show", "-p", "NTPSynchronized", "--value"], timeout=10)
+    if not ok:
+        add("Clock synchronisation", "164.312(b)", "unknown",
+            f"Cannot check time sync: {no_systemd if 'systemd' in output or 'bus' in output else output[:120]}.")
+    else:
+        synced = output.strip() == "yes"
+        add("Clock synchronisation", "164.312(b)", "pass" if synced else "fail", f"NTP synchronised: {output.strip()}.",
+            "" if synced else "Enable time sync: 'sudo timedatectl set-ntp true'.")
+    return checks
+
+
+@mcp.tool()
+def compliance_check(output_format: str = "text") -> str:
+    """
+    Read-only HIPAA-oriented technical safeguards check (encryption, audit logging, automatic logoff,
+    password rules, patching, remote access, firewall, unique IDs, clock sync), each mapped to its
+    Security Rule citation. This is a self-assessment aid, not a certification or legal advice.
+    """
+    checks = run_compliance_checks()
+    if output_format == "json":
+        return json.dumps(checks)
+    passed = sum(c["status"] == "pass" for c in checks)
+    lines = [f"COMPLIANCE CHECK: {passed}/{len(checks)} technical safeguards pass "
+             "(self-assessment aid, not a certification or legal advice)."]
+    for c in checks:
+        lines.append(f"[{c['status'].upper()}] {c['safeguard']} ({c['citation']}): {c['detail']}")
+        if c["fix"]:
+            lines.append(f"    Fix: {c['fix']}")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":

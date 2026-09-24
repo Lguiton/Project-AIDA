@@ -20,7 +20,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from src import audit, monitor
+from src import audit, monitor, notify, reports, scheduler, users
 from src.db import DB_URI, KB_COLLECTION, TICKETS_TABLE_SQL
 from src.graph.graph import compile_aida_graph
 from src.kb.learn import forget_ticket, learn_from_ticket, should_learn
@@ -31,6 +31,8 @@ mcp_client = None
 db_pool = None
 monitor_task = None
 monitor_lock = None
+scheduler_task = None
+aida_tools: dict = {}
 
 # Graph nodes that are not AI agents (tool executors, routing sentinels, the human hand-off)
 NON_AGENT_NODES = {"__start__", "__end__", "human_escalation"}
@@ -38,7 +40,7 @@ NON_AGENT_NODES = {"__start__", "__end__", "human_escalation"}
 
 def tool_server_env() -> dict[str, str]:
     """Environment for the MCP tool server: everything except secrets."""
-    secret_markers = ("KEY", "PASSWORD", "SECRET", "TOKEN")
+    secret_markers = ("KEY", "PASSWORD", "SECRET", "TOKEN", "WEBHOOK", "SMTP")
     shell_only = {"PS1", "PS2", "PROMPT_COMMAND"}  # interactive prompt settings; the MCP SDK warns about them
     return {name: value for name, value in os.environ.items()
             if name not in shell_only and not any(marker in name.upper() for marker in secret_markers)}
@@ -46,7 +48,7 @@ def tool_server_env() -> dict[str, str]:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global aida_graph, mcp_client, db_pool, monitor_task, monitor_lock
+    global aida_graph, mcp_client, db_pool, monitor_task, monitor_lock, scheduler_task, aida_tools
 
     # 1. Database: one pool shared by the LangGraph checkpointer and the tickets table
     print("\n[System] Connecting to Postgres...")
@@ -63,6 +65,10 @@ async def lifespan(app: FastAPI):
         for statement in TICKETS_TABLE_SQL:
             await conn.execute(statement)
     await audit.ensure_audit_schema(db_pool)
+    await scheduler.ensure_schema(db_pool)
+    note = await users.ensure_users(db_pool)
+    if note:
+        print(f"[System] {note}")
     print("[System] Postgres ready (tickets persist across restarts).")
 
     # 2. MCP tools. sys.executable enforces the virtual environment's Python
@@ -78,6 +84,7 @@ async def lifespan(app: FastAPI):
         }
     })
     tools = await mcp_client.get_tools()
+    aida_tools = {t.name: t for t in tools}
     print(f"[System] Fetched {len(tools)} tools via MCP: {[t.name for t in tools]}")
 
     # 3. Route tools to the correct agents
@@ -85,9 +92,11 @@ async def lifespan(app: FastAPI):
         return [t for t in tools if t.name in names]
 
     net_tools = pick("ping_host", "resolve_dns", "get_adapter_status")
-    rem_tools = pick("flush_dns_cache", "restart_service", "clear_temp_files")
+    rem_tools = pick("flush_dns_cache", "restart_service", "clear_temp_files", "rotate_logs", "docker_prune",
+                     "restart_container", "block_ip", "unblock_ip", "install_security_updates", "run_runbook")
     os_tools = pick("get_system_info", "check_disk_usage", "list_top_processes", "check_service_status")
-    sec_tools = pick("list_listening_ports", "list_recent_logins", "security_audit", "list_failed_logins")
+    sec_tools = pick("list_listening_ports", "list_recent_logins", "security_audit", "list_failed_logins",
+                     "scan_vulnerabilities", "compliance_check")
 
     # 4. Compile the graph with injected tools and the Postgres checkpointer
     llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
@@ -104,9 +113,23 @@ async def lifespan(app: FastAPI):
         monitor_task = asyncio.create_task(monitor.monitor_loop(db_pool, open_monitor_ticket, interval, monitor_lock))
         print(f"[System] Monitoring every {interval:.0f}s (set AIDA_MONITOR_INTERVAL=0 to turn off).")
 
+    # 6. Scheduled maintenance (runbooks approved in advance by an admin)
+    scheduler_interval = float(os.getenv("AIDA_SCHEDULER_INTERVAL", "60") or 0)
+    if scheduler_interval > 0:
+        scheduler_task = asyncio.create_task(scheduler.scheduler_loop(
+            db_pool, run_runbook_now, record_schedule_audit, notify_maintenance_failure, scheduler_interval))
+
     print("[System] Project AIDA API Ready.")
 
     yield
+
+    if scheduler_task:
+        scheduler_task.cancel()
+        try:
+            await scheduler_task
+        except asyncio.CancelledError:
+            pass
+        scheduler_task = None
 
     if monitor_task:
         monitor_task.cancel()
@@ -119,6 +142,7 @@ async def lifespan(app: FastAPI):
     print("\n[System] Shutting down MCP Server...")
     if hasattr(mcp_client, "close") and callable(mcp_client.close):
         await mcp_client.close()
+    await notify.drain()
     await close_vector_store()
     await db_pool.close()
 
@@ -130,7 +154,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
     allow_methods=["GET", "POST"],
-    allow_headers=["X-AIDA-Key", "X-AIDA-Actor", "Content-Type"],
+    allow_headers=["X-AIDA-Key", "X-AIDA-User-Token", "Content-Type"],
 )
 
 
@@ -146,10 +170,37 @@ async def require_api_key(x_aida_key: str | None = Header(default=None)):
 api = APIRouter(prefix="/api", dependencies=[Depends(require_api_key)])
 
 
-def get_actor(x_aida_actor: str | None = Header(default=None)) -> str:
-    """Who is making the request, for the audit log (the dashboard sends the signed-in operator)."""
-    actor = (x_aida_actor or "api").strip()
-    return actor[:64] or "api"
+SERVICE_ACCOUNT = {"username": "api", "role": "admin"}
+
+
+async def current_user(x_aida_user_token: str | None = Header(default=None)) -> dict:
+    """The signed-in dashboard user (from their session token), or the 'api' service account for
+    scripts that only hold the API key. Role and enabled state are re-checked on every request."""
+    if not x_aida_user_token:
+        return SERVICE_ACCOUNT
+    claims = users.read_token(x_aida_user_token)
+    if not claims:
+        raise HTTPException(status_code=401, detail="Your session has expired. Please sign in again.")
+    async with db_pool.connection() as conn:
+        row = await (await conn.execute(
+            "SELECT username, role, disabled FROM aida_users WHERE username = %s", (claims["username"],)
+        )).fetchone()
+    if not row or row["disabled"]:
+        raise HTTPException(status_code=401, detail="This account is disabled or no longer exists.")
+    return {"username": row["username"], "role": row["role"]}
+
+
+def require_role(role: str):
+    async def check(user: dict = Depends(current_user)) -> dict:
+        if not users.role_at_least(user["role"], role):
+            raise HTTPException(status_code=403, detail=f"This action needs the '{role}' role; you are '{user['role']}'.")
+        return user
+    return check
+
+
+requester = Depends(require_role("requester"))
+approver = Depends(require_role("approver"))
+admin = Depends(require_role("admin"))
 
 
 class TicketRequest(BaseModel):
@@ -289,6 +340,31 @@ async def root():
     return {"message": "Project AIDA Backend is Running! Go to http://127.0.0.1:8006/docs to interact with the API."}
 
 
+def tool_text(result) -> str:
+    """MCP tool results arrive as text or as a list of content blocks, depending on the adapter version."""
+    if isinstance(result, str):
+        return result
+    if isinstance(result, list):
+        return "\n".join(block.get("text", "") if isinstance(block, dict) else str(block) for block in result)
+    return str(result)
+
+
+async def call_tool(name: str, args: dict | None = None) -> str:
+    return tool_text(await aida_tools[name].ainvoke(args or {}))
+
+
+async def run_runbook_now(runbook: str) -> str:
+    return await call_tool("run_runbook", {"name": runbook})
+
+
+async def record_schedule_audit(actor, action, thread_id, details):
+    await audit.record(db_pool, actor, action, thread_id, details)
+
+
+def notify_maintenance_failure(summary, thread_id):
+    notify.send_in_background("fix_failed", summary, thread_id)
+
+
 def pending_tool_calls(values: dict) -> list[dict]:
     messages = (values or {}).get("messages") or []
     calls = getattr(messages[-1], "tool_calls", None) if messages else None
@@ -309,8 +385,15 @@ async def start_ticket(issue: str, actor: str, source: str = "user", alert_key: 
     })
     if ticket["requires_approval"]:
         state = await aida_graph.aget_state(config)
+        tools = pending_tool_calls(state.values)
         await audit.record(db_pool, "agent:" + ticket["current_specialist"], "remediation.requested", thread_id,
-                           {"tools": pending_tool_calls(state.values)})
+                           {"tools": tools})
+        wanted = ", ".join(t["name"] + (f" {t['args']}" if t["args"] else "") for t in tools)
+        notify.send_in_background("approval_needed", f"AIDA wants to run {wanted} for: {issue[:200]}", thread_id)
+    if source == "monitor":
+        notify.send_in_background("auto_ticket", issue.replace(monitor.AUTO_PREFIX, "").strip()[:300], thread_id)
+    if ticket["status"] == "escalated":
+        notify.send_in_background("escalated", f"A ticket needs a human: {issue[:200]}", thread_id)
     await maybe_learn(ticket)  # after "ticket.created", so the audit log reads in order
     return ticket
 
@@ -320,12 +403,12 @@ async def open_monitor_ticket(alert) -> dict:
 
 
 @api.post("/tickets")
-async def create_ticket(request: TicketRequest, actor: str = Depends(get_actor)):
-    return await start_ticket(request.issue, actor)
+async def create_ticket(request: TicketRequest, user: dict = requester):
+    return await start_ticket(request.issue, user["username"])
 
 
 @api.get("/tickets")
-async def list_tickets(limit: int = 50):
+async def list_tickets(limit: int = 50, user: dict = requester):
     """Most recent tickets first, read from Postgres (survives restarts)."""
     limit = max(1, min(limit, 200))
     async with db_pool.connection() as conn:
@@ -343,7 +426,7 @@ async def list_tickets(limit: int = 50):
 
 
 @api.get("/tickets/{thread_id}")
-async def get_ticket(thread_id: str):
+async def get_ticket(thread_id: str, user: dict = requester):
     ticket = await snapshot_ticket(thread_id)
     if ticket is None:
         raise HTTPException(status_code=404, detail="Ticket not found")
@@ -351,7 +434,8 @@ async def get_ticket(thread_id: str):
 
 
 @api.post("/tickets/{thread_id}/approve")
-async def approve_remediation(thread_id: str, request: ApprovalRequest, actor: str = Depends(get_actor)):
+async def approve_remediation(thread_id: str, request: ApprovalRequest, user: dict = approver):
+    actor = user["username"]
     config = {"configurable": {"thread_id": thread_id}}
     state = await aida_graph.aget_state(config)
 
@@ -377,6 +461,8 @@ async def approve_remediation(thread_id: str, request: ApprovalRequest, actor: s
         ticket = await snapshot_ticket(thread_id, learn=False)
         await audit.record(db_pool, "agent:remediate", "remediation.executed", thread_id,
                            {"results": results, "status": ticket["status"]})
+        if ticket["status"] == "failed":
+            notify.send_in_background("fix_failed", f"An approved fix did not work: {(ticket['last_message'] or '')[:300]}", thread_id)
         await maybe_learn(ticket)
         return {"message": "Remediation approved and executed.", **ticket}
     # Denied: answer each pending tool call with a refusal so nothing runs, then close the ticket
@@ -400,7 +486,8 @@ async def approve_remediation(thread_id: str, request: ApprovalRequest, actor: s
 
 
 @api.post("/tickets/{thread_id}/forget")
-async def forget_learned_ticket(thread_id: str, actor: str = Depends(get_actor)):
+async def forget_learned_ticket(thread_id: str, user: dict = approver):
+    actor = user["username"]
     """Remove a ticket from the knowledge base and stop it from being learned again."""
     async with db_pool.connection() as conn:
         row = await (await conn.execute(
@@ -420,25 +507,26 @@ async def forget_learned_ticket(thread_id: str, actor: str = Depends(get_actor))
 
 
 @api.get("/audit")
-async def audit_log(limit: int = 100, thread_id: str | None = None):
+async def audit_log(limit: int = 100, thread_id: str | None = None, user: dict = approver):
     """Most recent audit entries first."""
     return await audit.recent(db_pool, max(1, min(limit, 1000)), thread_id)
 
 
 @api.get("/audit/verify")
-async def audit_verify():
+async def audit_verify(user: dict = approver):
     """Recompute the hash chain to prove no audit entry was changed or removed."""
     return await audit.verify_chain(db_pool)
 
 
 @api.get("/monitor/status")
-async def monitor_status():
+async def monitor_status(user: dict = requester):
     interval = float(os.getenv("AIDA_MONITOR_INTERVAL", "300") or 0)
     return {"enabled": interval > 0, "interval_seconds": interval, **monitor.last_run}
 
 
 @api.post("/monitor/run")
-async def monitor_run(actor: str = Depends(get_actor)):
+async def monitor_run(user: dict = approver):
+    actor = user["username"]
     """Run all health checks now (tickets are only opened for new problems)."""
     result = await monitor.run_once(db_pool, open_monitor_ticket, lock=monitor_lock)
     await audit.record(db_pool, actor, "monitor.run", None,
@@ -446,8 +534,214 @@ async def monitor_run(actor: str = Depends(get_actor)):
     return result
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class NewUser(BaseModel):
+    username: str
+    password: str
+    role: str = "requester"
+
+
+class UserUpdate(BaseModel):
+    role: str | None = None
+    disabled: bool | None = None
+    password: str | None = None
+
+
+@api.post("/auth/login")
+async def login(request: LoginRequest):
+    """Sign in with a username and password; returns a session token for the X-AIDA-User-Token header."""
+    username = request.username.strip().lower()
+    if users.locked_out(username):
+        raise HTTPException(status_code=429, detail="Too many failed sign-in attempts. Try again in 5 minutes.")
+    user = await users.authenticate(db_pool, username, request.password)
+    if not user:
+        users.note_failure(username)
+        await audit.record(db_pool, username or "unknown", "auth.login_failed", None, {})
+        raise HTTPException(status_code=401, detail="Incorrect username or password.")
+    users.clear_failures(username)
+    await audit.record(db_pool, user["username"], "auth.login", None, {"role": user["role"]})
+    return {**user, "token": users.issue_token(user["username"], user["role"])}
+
+
+@api.get("/auth/me")
+async def me(user: dict = Depends(current_user)):
+    return user
+
+
+@api.get("/users")
+async def get_users(user: dict = admin):
+    return await users.list_users(db_pool)
+
+
+@api.post("/users")
+async def add_user(new: NewUser, user: dict = admin):
+    username = new.username.strip().lower()
+    if not username.replace("_", "").replace(".", "").replace("-", "").isalnum() or len(username) > 40:
+        raise HTTPException(status_code=400, detail="Usernames may contain letters, digits, '.', '_' and '-' (max 40).")
+    if new.role not in users.ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of {', '.join(users.ROLES)}.")
+    if problem := users.validate_new_password(new.password):
+        raise HTTPException(status_code=400, detail=problem)
+    try:
+        await users.create_user(db_pool, username, new.password, new.role)
+    except Exception:
+        raise HTTPException(status_code=409, detail=f"User '{username}' already exists.")
+    await audit.record(db_pool, user["username"], "user.created", None, {"username": username, "role": new.role})
+    return {"username": username, "role": new.role}
+
+
+@api.post("/users/{username}")
+async def change_user(username: str, change: UserUpdate, user: dict = admin):
+    if change.role is not None and change.role not in users.ROLES:
+        raise HTTPException(status_code=400, detail=f"Role must be one of {', '.join(users.ROLES)}.")
+    if change.password is not None and (problem := users.validate_new_password(change.password)):
+        raise HTTPException(status_code=400, detail=problem)
+    # Never lock everyone out: keep at least one active admin
+    removing_admin = change.disabled or (change.role is not None and change.role != "admin")
+    if removing_admin:
+        current = [u for u in await users.list_users(db_pool) if u["username"] == username]
+        if current and current[0]["role"] == "admin" and not current[0]["disabled"] \
+                and await users.active_admin_count(db_pool) <= 1:
+            raise HTTPException(status_code=400, detail="This is the last active admin; add another admin first.")
+    if not await users.update_user(db_pool, username, change.role, change.disabled, change.password):
+        raise HTTPException(status_code=404, detail="User not found")
+    details = {k: v for k, v in change.model_dump().items() if v is not None and k != "password"}
+    if change.password is not None:
+        details["password_reset"] = True
+    await audit.record(db_pool, user["username"], "user.updated", None, {"username": username, **details})
+    return {"username": username, **details}
+
+
+@api.get("/notify/status")
+async def notify_status(user: dict = approver):
+    return {**notify.configured_channels(), "recent": notify.history[-20:][::-1]}
+
+
+@api.post("/notify/test")
+async def notify_test(user: dict = admin):
+    results = await asyncio.to_thread(notify.send_now, "test", f"Test message sent by {user['username']}.")
+    await audit.record(db_pool, user["username"], "notify.test", None, {"results": results})
+    if not results:
+        raise HTTPException(status_code=400, detail="No notification channels are configured in .env.")
+    return {"results": results}
+
+
+@api.get("/runbooks")
+async def list_runbooks(user: dict = requester):
+    from mcp_server import RUNBOOKS
+    return {name: {"description": rb["description"], "steps": [tool for tool, _args in rb["steps"]]}
+            for name, rb in RUNBOOKS.items()}
+
+
+@api.get("/reports/summary")
+async def report_summary(days: int = 30, user: dict = approver):
+    return await reports.summary(db_pool, days)
+
+
+@api.get("/reports/compliance")
+async def report_compliance(days: int = 30, user: dict = approver):
+    """HIPAA-oriented evidence pack: technical safeguards, security check, audit integrity, access activity."""
+    import json as _json
+    checks = _json.loads(await call_tool("compliance_check", {"output_format": "json"}))
+    security_report = await call_tool("security_audit")
+    verification = await audit.verify_chain(db_pool)
+    access = await reports.access_summary(db_pool, days)
+    markdown = reports.compliance_markdown(checks, security_report, verification, access, days)
+    await audit.record(db_pool, user["username"], "report.compliance", None,
+                       {"passed": sum(c["status"] == "pass" for c in checks), "total": len(checks)})
+    return {"checks": checks, "security_report": security_report, "audit": verification,
+            "access": access, "markdown": markdown}
+
+
+class NewSchedule(BaseModel):
+    name: str
+    runbook: str
+    frequency: str = "weekly"
+    weekday: str | None = "sunday"
+    at_time: str = "02:00"
+
+
+class ScheduleUpdate(BaseModel):
+    enabled: bool
+
+
+async def get_schedule(schedule_id: int) -> dict:
+    async with db_pool.connection() as conn:
+        row = await (await conn.execute("SELECT * FROM aida_schedules WHERE id = %s", (schedule_id,))).fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Schedule not found")
+    return row
+
+
+@api.get("/schedules")
+async def get_schedules(user: dict = approver):
+    return await scheduler.list_schedules(db_pool)
+
+
+@api.post("/schedules")
+async def add_schedule(new: NewSchedule, user: dict = admin):
+    from mcp_server import RUNBOOKS
+    if new.runbook not in RUNBOOKS:
+        raise HTTPException(status_code=400, detail=f"Unknown runbook. Choose one of: {', '.join(RUNBOOKS)}.")
+    if new.frequency not in ("daily", "weekly"):
+        raise HTTPException(status_code=400, detail="Frequency must be 'daily' or 'weekly'.")
+    weekday = None
+    if new.frequency == "weekly":
+        if (new.weekday or "").lower() not in scheduler.WEEKDAYS:
+            raise HTTPException(status_code=400, detail="Weekly schedules need a weekday (monday ... sunday).")
+        weekday = scheduler.WEEKDAYS.index(new.weekday.lower())
+    try:
+        scheduler.parse_time(new.at_time)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Time must be HH:MM in 24-hour format, e.g. 02:00.")
+    name = new.name.strip()[:60]
+    if not name:
+        raise HTTPException(status_code=400, detail="Give the schedule a name.")
+    try:
+        async with db_pool.connection() as conn:
+            row = await (await conn.execute(
+                "INSERT INTO aida_schedules (name, runbook, frequency, weekday, at_time, created_by) "
+                "VALUES (%s, %s, %s, %s, %s, %s) RETURNING *",
+                (name, new.runbook, new.frequency, weekday, new.at_time.strip(), user["username"]),
+            )).fetchone()
+    except Exception:
+        raise HTTPException(status_code=409, detail=f"A schedule named '{name}' already exists.")
+    await audit.record(db_pool, user["username"], "schedule.created", None,
+                       {"name": name, "runbook": new.runbook, "when": scheduler.describe(row)})
+    return row
+
+
+@api.post("/schedules/{schedule_id}")
+async def change_schedule(schedule_id: int, change: ScheduleUpdate, user: dict = admin):
+    row = await get_schedule(schedule_id)
+    async with db_pool.connection() as conn:
+        await conn.execute("UPDATE aida_schedules SET enabled = %s WHERE id = %s", (change.enabled, schedule_id))
+    await audit.record(db_pool, user["username"], "schedule.updated", None, {"name": row["name"], "enabled": change.enabled})
+    return {"id": schedule_id, "enabled": change.enabled}
+
+
+@api.post("/schedules/{schedule_id}/delete")
+async def delete_schedule(schedule_id: int, user: dict = admin):
+    row = await get_schedule(schedule_id)
+    async with db_pool.connection() as conn:
+        await conn.execute("DELETE FROM aida_schedules WHERE id = %s", (schedule_id,))
+    await audit.record(db_pool, user["username"], "schedule.deleted", None, {"name": row["name"]})
+    return {"deleted": schedule_id}
+
+
+@api.post("/schedules/{schedule_id}/run")
+async def run_schedule_now(schedule_id: int, user: dict = admin):
+    row = await get_schedule(schedule_id)
+    return await scheduler.run_schedule(db_pool, row, run_runbook_now, record_schedule_audit,
+                                        notify_maintenance_failure, trigger=f"manual by {user['username']}")
+
+
 @api.get("/metrics")
-async def metrics():
+async def metrics(user: dict = requester):
     """Live numbers for the dashboard."""
     async with db_pool.connection() as conn:
         counts = await (await conn.execute(

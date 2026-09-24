@@ -2,20 +2,23 @@
 import psycopg
 import pytest
 
+from tests.conftest import make_user
+
 pytestmark = pytest.mark.usefixtures("test_db")
 
 
-def create(client, issue):
-    response = client.post("/api/tickets", json={"issue": issue}, headers={"X-AIDA-Actor": "alice"})
+def create(client, issue, headers=None):
+    response = client.post("/api/tickets", json={"issue": issue}, headers=headers or {})
     assert response.status_code == 200, response.text
     return response.json()
 
 
 def test_actions_are_recorded_with_who_did_them(api_client):
     with api_client() as client:
-        ticket = create(client, "please flush my dns")
-        client.post(f"/api/tickets/{ticket['thread_id']}/approve", json={"approved": False},
-                    headers={"X-AIDA-Actor": "bob"})
+        alice = make_user(client, "alice", "requester")
+        bob = make_user(client, "bob", "approver")
+        ticket = create(client, "please flush my dns", alice)
+        client.post(f"/api/tickets/{ticket['thread_id']}/approve", json={"approved": False}, headers=bob)
         entries = client.get("/api/audit", params={"thread_id": ticket["thread_id"]}).json()
 
     actions = [(e["actor"], e["action"]) for e in reversed(entries)]

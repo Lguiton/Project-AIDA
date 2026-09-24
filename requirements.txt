@@ -15,3 +15,4 @@ mcp
 psycopg[binary]
 psycopg-pool
 sqlalchemy
+pip-audit

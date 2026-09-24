@@ -26,6 +26,7 @@ os.environ["AIDA_DB_URI"] = TEST_DB_URI
 os.environ["AIDA_API_KEY"] = "test-api-key"
 os.environ["AIDA_UI_PASSWORD"] = "test-password"
 os.environ["AIDA_MONITOR_INTERVAL"] = "0"  # tests trigger monitoring runs explicitly
+os.environ["AIDA_SCHEDULER_INTERVAL"] = "0"  # tests run schedules explicitly
 os.environ.setdefault("OPENAI_API_KEY", "not-used-in-tests")
 
 
@@ -53,6 +54,8 @@ def test_db():
     with psycopg.connect(TEST_DB_URI, autocommit=True) as conn:
         conn.execute("DROP TABLE IF EXISTS aida_tickets")
         conn.execute("DROP TABLE IF EXISTS aida_audit")
+        conn.execute("DROP TABLE IF EXISTS aida_users")
+        conn.execute("DROP TABLE IF EXISTS aida_schedules")
     return TEST_DB_URI
 
 
@@ -82,3 +85,17 @@ def api_client(test_db, temp_dir_for_tools, monkeypatch):
         return TestClient(main.app, headers=headers)
 
     return make_client
+
+
+def login(client, username: str, password: str) -> dict:
+    """Sign in through the API and return headers carrying that user's session token."""
+    response = client.post("/api/auth/login", json={"username": username, "password": password})
+    assert response.status_code == 200, response.text
+    return {"X-AIDA-User-Token": response.json()["token"]}
+
+
+def make_user(client, username: str, role: str, password: str = "correct-horse-1") -> dict:
+    """Create a user as the admin service account (API key only) and return their headers."""
+    response = client.post("/api/users", json={"username": username, "password": password, "role": role})
+    assert response.status_code in (200, 409), response.text
+    return login(client, username, password)

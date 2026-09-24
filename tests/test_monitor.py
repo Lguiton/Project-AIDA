@@ -48,7 +48,7 @@ def test_certificate_check():
 
 @pytest.mark.usefixtures("test_db")
 def test_monitoring_opens_one_ticket_per_problem(api_client, monkeypatch):
-    alert = monitor.Alert(key="disk:/", check="disk",
+    alert = monitor.Alert(key="disk:/monitor-test", check="disk",
                           issue=f"{monitor.AUTO_PREFIX} The disk at / is 97% full (1.0 GB free of 50.0 GB).")
     monkeypatch.setattr(monitor, "collect_alerts", lambda: [alert])
 
@@ -58,15 +58,15 @@ def test_monitoring_opens_one_ticket_per_problem(api_client, monkeypatch):
         thread_id = first["opened"][0]["thread_id"]
 
         ticket = client.get(f"/api/tickets/{thread_id}").json()
-        assert ticket["source"] == "monitor" and ticket["alert_key"] == "disk:/"
+        assert ticket["source"] == "monitor" and ticket["alert_key"] == "disk:/monitor-test"
         assert ticket["current_specialist"] == "os_diag"
 
         # Same problem again: recorded but no duplicate ticket
         second = client.post("/api/monitor/run").json()
-        assert second["opened"] == [] and second["suppressed"] == ["disk:/"]
+        assert second["opened"] == [] and second["suppressed"] == ["disk:/monitor-test"]
 
         status = client.get("/api/monitor/status").json()
-        assert status["alerts"][0]["key"] == "disk:/"
+        assert status["alerts"][0]["key"] == "disk:/monitor-test"
 
         audit = client.get("/api/audit", params={"thread_id": thread_id}).json()
         oldest = audit[-1]  # newest first

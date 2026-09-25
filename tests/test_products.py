@@ -80,6 +80,8 @@ def test_health_check_reads_eivanta_status(health_server):
     assert products.check_health(url) == "product reports 'degraded' (database unreachable)"
     state["status"] = 503
     assert products.check_health(url) == "health check returned HTTP 503"
+    state["status"] = 404
+    assert products.check_health(url).startswith("health check returned HTTP 404: nothing answers at that address")
     assert products.check_health("http://127.0.0.1:9/api/v1/status").startswith("health check failed")
 
 

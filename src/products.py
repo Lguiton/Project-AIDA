@@ -206,6 +206,9 @@ def check_health(url: str, timeout: float = 5.0) -> str | None:
         with urllib.request.urlopen(urllib.request.Request(url, method="GET"), timeout=timeout) as response:
             status, body = response.status, response.read(65536)
     except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return ("health check returned HTTP 404: nothing answers at that address. Check the health URL, and that "
+                    "the right app (and version) is running on that port")
         return f"health check returned HTTP {e.code}"
     except Exception as e:
         return f"health check failed: {str(e)[:150]}"

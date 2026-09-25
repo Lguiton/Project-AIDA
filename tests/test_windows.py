@@ -190,3 +190,14 @@ def test_windows_runbooks_are_available():
              ("windows_update_signatures", "windows_defender_scan")}
     assert mcp_server.run_runbook_steps("windows_security_refresh", steps).startswith("SUCCESS")
     assert calls == ["windows_update_signatures", "windows_defender_scan"]
+
+
+def test_windows_check_result_is_recorded_for_the_dashboard():
+    monitor.check_windows(snapshot=lambda: snap(firewall=[{"profile": "Public", "enabled": False}]))
+    assert monitor.windows_status["ok"] is True and monitor.windows_status["problems"] == 1
+    assert monitor.windows_status["computer"] == "DESKTOP-TEST"
+
+    def broken():
+        raise RuntimeError("Get-CimInstance failed")
+    monitor.check_windows(snapshot=broken)
+    assert monitor.windows_status["ok"] is False and "Get-CimInstance failed" in monitor.windows_status["error"]

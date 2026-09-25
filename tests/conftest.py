@@ -59,6 +59,7 @@ def test_db():
         conn.execute("DROP TABLE IF EXISTS aida_schedules")
         conn.execute("DROP TABLE IF EXISTS aida_products")
         conn.execute("DROP TABLE IF EXISTS aida_product_errors")
+        conn.execute("DROP TABLE IF EXISTS aida_machines")
     return TEST_DB_URI
 
 

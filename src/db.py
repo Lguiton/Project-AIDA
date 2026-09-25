@@ -33,4 +33,6 @@ TICKETS_TABLE_SQL = (
     "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS source TEXT NOT NULL DEFAULT 'user'",
     "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS alert_key TEXT",
     "CREATE INDEX IF NOT EXISTS aida_tickets_alert_key ON aida_tickets (alert_key) WHERE alert_key IS NOT NULL",
+    # Which computer the ticket is about ('local' = the one AIDA runs on; others: src/machines.py)
+    "ALTER TABLE aida_tickets ADD COLUMN IF NOT EXISTS machine TEXT NOT NULL DEFAULT 'local'",
 )

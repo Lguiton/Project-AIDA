@@ -22,7 +22,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from psycopg.rows import dict_row
 from psycopg_pool import AsyncConnectionPool
 
-from src import audit, monitor, notify, products, reports, scheduler, users, windows
+from src import audit, machines, monitor, notify, products, reports, scheduler, users, windows
 from src.db import DB_URI, KB_COLLECTION, TICKETS_TABLE_SQL
 from src.graph.graph import compile_aida_graph
 from src.kb.learn import forget_ticket, learn_from_ticket, should_learn
@@ -69,6 +69,8 @@ async def lifespan(app: FastAPI):
     await audit.ensure_audit_schema(db_pool)
     await scheduler.ensure_schema(db_pool)
     await products.ensure_schema(db_pool)
+    await machines.ensure_schema(db_pool)
+    machines.set_registry(await machines.list_machines(db_pool))
     note = await users.ensure_users(db_pool)
     if note:
         print(f"[System] {note}")
@@ -86,9 +88,13 @@ async def lifespan(app: FastAPI):
             "env": tool_server_env(),
         }
     })
-    tools = await mcp_client.get_tools()
-    aida_tools = {t.name: t for t in tools}
-    print(f"[System] Fetched {len(tools)} tools via MCP: {[t.name for t in tools]}")
+    local_tools = await mcp_client.get_tools()
+    aida_tools = {t.name: t for t in local_tools}  # this computer's tools (scheduled maintenance, backups)
+    print(f"[System] Fetched {len(local_tools)} tools via MCP: {[t.name for t in local_tools]}")
+    # The agents get dispatchers: each call runs on the ticket's machine (this computer unless chosen otherwise)
+    tools = machines.wrap_tools(local_tools)
+    if machines.registry():
+        print(f"[System] Other machines: {', '.join(m['name'] for m in machines.registry().values())}")
 
     # 3. Route tools to the correct agents
     def pick(*names):
@@ -116,7 +122,7 @@ async def lifespan(app: FastAPI):
     interval = float(os.getenv("AIDA_MONITOR_INTERVAL", "300") or 0)
     if interval > 0:
         monitor_task = asyncio.create_task(monitor.monitor_loop(
-            db_pool, open_monitor_ticket, interval, monitor_lock, extra_collect=product_health_alerts))
+            db_pool, open_monitor_ticket, interval, monitor_lock, extra_collect=extra_alerts))
         print(f"[System] Monitoring every {interval:.0f}s (set AIDA_MONITOR_INTERVAL=0 to turn off).")
 
     # 6. Scheduled maintenance (runbooks approved in advance by an admin)
@@ -211,6 +217,7 @@ admin = Depends(require_role("admin"))
 
 class TicketRequest(BaseModel):
     issue: str
+    machine: str = machines.LOCAL
 
 
 class ApprovalRequest(BaseModel):
@@ -240,8 +247,8 @@ def agent_names() -> list[str]:
     )
 
 
-async def snapshot_ticket(thread_id: str, issue: str | None = None,
-                          source: str = "user", alert_key: str | None = None, learn: bool = True) -> dict | None:
+async def snapshot_ticket(thread_id: str, issue: str | None = None, source: str = "user",
+                          alert_key: str | None = None, learn: bool = True, machine: str | None = None) -> dict | None:
     """Read a ticket's current state from the graph checkpoint and save a summary row."""
     config = {"configurable": {"thread_id": thread_id}}
     state = await aida_graph.aget_state(config)
@@ -263,18 +270,18 @@ async def snapshot_ticket(thread_id: str, issue: str | None = None,
         row = await (await conn.execute(
             """
             INSERT INTO aida_tickets (thread_id, issue, status, current_specialist, requires_approval,
-                                      last_message, source, alert_key)
+                                      last_message, source, alert_key, machine)
             VALUES (%(thread_id)s, %(issue)s, %(status)s, %(current_specialist)s, %(requires_approval)s,
-                    %(last_message)s, %(source)s, %(alert_key)s)
+                    %(last_message)s, %(source)s, %(alert_key)s, %(machine)s)
             ON CONFLICT (thread_id) DO UPDATE SET
                 status = EXCLUDED.status,
                 current_specialist = EXCLUDED.current_specialist,
                 requires_approval = EXCLUDED.requires_approval,
                 last_message = EXCLUDED.last_message,
                 updated_at = now()
-            RETURNING issue, learned, forgotten, source, alert_key, created_at, updated_at
+            RETURNING issue, learned, forgotten, source, alert_key, machine, created_at, updated_at
             """,
-            {**ticket, "issue": issue, "source": source, "alert_key": alert_key},
+            {**ticket, "issue": issue, "source": source, "alert_key": alert_key, "machine": machine or machines.LOCAL},
         )).fetchone()
 
     result = {**ticket, **row}
@@ -377,16 +384,37 @@ def pending_tool_calls(values: dict) -> list[dict]:
     return [{"name": c["name"], "args": c.get("args", {})} for c in (calls or [])]
 
 
-async def start_ticket(issue: str, actor: str, source: str = "user", alert_key: str | None = None) -> dict:
+async def run_graph_on(machine: str, graph_input, config: dict) -> None:
+    """Run (or resume) a ticket's agents with every tool call sent to the ticket's machine."""
+    token = machines.current_machine.set(machine or machines.LOCAL)
+    try:
+        async for _ in aida_graph.astream(graph_input, config=config):
+            pass
+    finally:
+        machines.current_machine.reset(token)
+
+
+async def ticket_machine(thread_id: str) -> str:
+    async with db_pool.connection() as conn:
+        row = await (await conn.execute("SELECT machine FROM aida_tickets WHERE thread_id = %s", (thread_id,))).fetchone()
+    return row["machine"] if row else machines.LOCAL
+
+
+async def start_ticket(issue: str, actor: str, source: str = "user", alert_key: str | None = None,
+                       machine: str = machines.LOCAL) -> dict:
     """Run a new ticket through the agents, save it, and record it in the audit log."""
     thread_id = str(uuid.uuid4())
     config = {"configurable": {"thread_id": thread_id}}
-    async for _ in aida_graph.astream({"messages": [HumanMessage(content=issue)]}, config=config):
-        pass
+    machine = machine or machines.LOCAL
+    if machine != machines.LOCAL and not issue.startswith(monitor.AUTO_PREFIX):
+        # Tell the agents (and the queue) which computer this is about
+        issue = f"[On {machines.registry().get(machine, {}).get('name', machine)}] {issue}"
+    await run_graph_on(machine, {"messages": [HumanMessage(content=issue)]}, config)
 
-    ticket = await snapshot_ticket(thread_id, issue=issue, source=source, alert_key=alert_key, learn=False)
+    ticket = await snapshot_ticket(thread_id, issue=issue, source=source, alert_key=alert_key, learn=False,
+                                   machine=machine)
     await audit.record(db_pool, actor, "ticket.created", thread_id, {
-        "issue": issue[:500], "source": source, "alert_key": alert_key,
+        "issue": issue[:500], "source": source, "alert_key": alert_key, "machine": machine,
         "specialist": ticket["current_specialist"], "status": ticket["status"],
     })
     if ticket["requires_approval"]:
@@ -405,12 +433,33 @@ async def start_ticket(issue: str, actor: str, source: str = "user", alert_key: 
 
 
 async def open_monitor_ticket(alert) -> dict:
-    return await start_ticket(alert.issue, actor="monitor", source="monitor", alert_key=alert.key)
+    return await start_ticket(alert.issue, actor="monitor", source="monitor", alert_key=alert.key,
+                              machine=getattr(alert, "machine", None) or machines.LOCAL)
+
+
+async def extra_alerts() -> list:
+    """Checks beyond this computer: connected products' health and other machines."""
+    alerts = []
+    for collect in (product_health_alerts, machine_alerts):
+        try:
+            alerts += await collect()
+        except Exception as e:
+            print(f"[Monitor] {collect.__name__} failed: {e}")
+    return alerts
+
+
+async def machine_alerts() -> list:
+    return await machines.monitor_all(monitor.Alert, monitor.AUTO_PREFIX)
 
 
 @api.post("/tickets")
 async def create_ticket(request: TicketRequest, user: dict = requester):
-    return await start_ticket(request.issue, user["username"])
+    machine = request.machine or machines.LOCAL
+    if machine != machines.LOCAL:
+        known = machines.registry().get(machine)
+        if not known or not known["enabled"]:
+            raise HTTPException(status_code=400, detail=f"Unknown or disabled machine: {machine}")
+    return await start_ticket(request.issue, user["username"], machine=machine)
 
 
 @api.get("/tickets")
@@ -421,7 +470,7 @@ async def list_tickets(limit: int = 50, user: dict = requester):
         rows = await (await conn.execute(
             """
             SELECT t.thread_id, t.issue, t.status, t.current_specialist, t.requires_approval,
-                   t.last_message, t.learned, t.forgotten, t.source, t.alert_key, t.created_at, t.updated_at,
+                   t.last_message, t.learned, t.forgotten, t.source, t.alert_key, t.machine, t.created_at, t.updated_at,
                    e.occurrences, e.tenants, e.last_seen, e.product_id
             FROM aida_tickets t
             LEFT JOIN aida_product_errors e ON e.alert_key = t.alert_key
@@ -456,9 +505,9 @@ async def approve_remediation(thread_id: str, request: ApprovalRequest, user: di
 
     requested = pending_tool_calls(state.values)
     if request.approved:
-        await audit.record(db_pool, actor, "remediation.approved", thread_id, {"tools": requested})
-        async for _ in aida_graph.astream(None, config=config):
-            pass
+        machine = await ticket_machine(thread_id)
+        await audit.record(db_pool, actor, "remediation.approved", thread_id, {"tools": requested, "machine": machine})
+        await run_graph_on(machine, None, config)
         # Record exactly what the tools reported
         final = await aida_graph.aget_state(config)
         call_ids = {tc["id"] for tc in getattr(state.values["messages"][-1], "tool_calls", None) or []}
@@ -529,14 +578,17 @@ async def audit_verify(user: dict = approver):
 @api.get("/monitor/status")
 async def monitor_status(user: dict = requester):
     interval = float(os.getenv("AIDA_MONITOR_INTERVAL", "300") or 0)
-    return {"enabled": interval > 0, "interval_seconds": interval, "windows": windows.monitoring_enabled(), **monitor.last_run}
+    return {"enabled": interval > 0, "interval_seconds": interval, "windows": windows.monitoring_enabled(),
+            "windows_status": monitor.windows_status, **monitor.last_run,
+            "machines": [{"id": m["id"], "name": m["name"], **machines.status.get(m["id"], {})}
+                         for m in machines.registry().values() if m["enabled"]]}
 
 
 @api.post("/monitor/run")
 async def monitor_run(user: dict = approver):
     actor = user["username"]
     """Run all health checks now (tickets are only opened for new problems)."""
-    result = await monitor.run_once(db_pool, open_monitor_ticket, lock=monitor_lock, extra_collect=product_health_alerts)
+    result = await monitor.run_once(db_pool, open_monitor_ticket, lock=monitor_lock, extra_collect=extra_alerts)
     await audit.record(db_pool, actor, "monitor.run", None,
                        {"alerts": len(result["alerts"]), "opened": [o["alert_key"] for o in result["opened"]]})
     return result
@@ -865,6 +917,92 @@ async def change_product(product_id: str, change: ProductUpdate, user: dict = ad
     details = {k: v for k, v in change.model_dump().items() if v not in (None, False)}
     await audit.record(db_pool, user["username"], "product.updated", None, {"product": product_id, **details})
     return {"id": product_id, **details, **({"intake_secret": secret} if secret else {})}
+
+
+# ---- Other machines (Phase 9) ---------------------------------------------------------
+
+class NewMachine(BaseModel):
+    id: str
+    name: str
+    ssh_target: str
+    ssh_port: int = 22
+    remote_command: str = machines.DEFAULT_REMOTE_COMMAND
+
+
+class MachineUpdate(BaseModel):
+    name: str | None = None
+    ssh_target: str | None = None
+    ssh_port: int | None = None
+    remote_command: str | None = None
+    enabled: bool | None = None
+
+
+async def refresh_machines() -> None:
+    machines.set_registry(await machines.list_machines(db_pool))
+
+
+@api.get("/machines")
+async def get_machines(user: dict = requester):
+    """This computer plus every machine AIDA looks after over SSH (connection details for admins only)."""
+    import socket
+    rows = [{"id": machines.LOCAL, "name": f"This computer ({socket.gethostname()})", "enabled": True}]
+    for m in machines.registry().values():
+        row = {"id": m["id"], "name": m["name"], "enabled": m["enabled"], "status": machines.status.get(m["id"])}
+        if users.role_at_least(user["role"], "admin"):
+            row.update({k: m[k] for k in ("ssh_target", "ssh_port", "remote_command", "created_by")})
+        rows.append(row)
+    return rows
+
+
+@api.post("/machines")
+async def add_machine(new: NewMachine, user: dict = admin):
+    machine_id = new.id.strip().lower()
+    error = machines.validate(machine_id, new.ssh_target.strip(), new.ssh_port, new.remote_command)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    try:
+        await machines.add_machine(db_pool, machine_id, new.name.strip()[:80] or machine_id, new.ssh_target.strip(),
+                                   new.ssh_port, new.remote_command, user["username"])
+    except Exception:
+        raise HTTPException(status_code=409, detail=f"Machine '{machine_id}' already exists.")
+    await refresh_machines()
+    await audit.record(db_pool, user["username"], "machine.added", None,
+                       {"machine": machine_id, "ssh_target": new.ssh_target, "ssh_port": new.ssh_port,
+                        "remote_command": new.remote_command})
+    return {"id": machine_id}
+
+
+@api.post("/machines/{machine_id}")
+async def change_machine(machine_id: str, change: MachineUpdate, user: dict = admin):
+    if not await machines.get_machine(db_pool, machine_id):
+        raise HTTPException(status_code=404, detail="Machine not found")
+    error = machines.validate(None, change.ssh_target, change.ssh_port, change.remote_command)
+    if error:
+        raise HTTPException(status_code=400, detail=error)
+    await machines.update_machine(db_pool, machine_id, **change.model_dump())
+    await refresh_machines()
+    details = {k: v for k, v in change.model_dump().items() if v is not None}
+    await audit.record(db_pool, user["username"], "machine.updated", None, {"machine": machine_id, **details})
+    return {"id": machine_id, **details}
+
+
+@api.post("/machines/{machine_id}/test")
+async def test_machine(machine_id: str, user: dict = admin):
+    """Connect over SSH, list the agent's tools and read basic system info. Changes nothing there."""
+    machine = await machines.get_machine(db_pool, machine_id)
+    if not machine:
+        raise HTTPException(status_code=404, detail="Machine not found")
+    machines.forget_tools(machine_id)
+    try:
+        tools = await machines.fetch_tools(machine)
+        info = machines.tool_text(await tools["get_system_info"].ainvoke({})) if "get_system_info" in tools else ""
+        result = {"ok": True, "tools": len(tools), "system_info": info,
+                  "missing_tools": sorted(set(aida_tools) - set(tools))}
+    except ConnectionError as e:
+        result = {"ok": False, "error": str(e)}
+    await audit.record(db_pool, user["username"], "machine.tested", None,
+                       {"machine": machine_id, "ok": result["ok"], **({"error": result["error"][:300]} if not result["ok"] else {})})
+    return result
 
 
 class CloseRequest(BaseModel):

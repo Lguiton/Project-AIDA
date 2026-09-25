@@ -869,6 +869,115 @@ def install_security_updates() -> str:
 
 
 # ---------------------------------------------------------------------------
+# AIDA's own database backup (approval-gated, or pre-approved as a schedule)
+# ---------------------------------------------------------------------------
+
+def _db_settings() -> dict:
+    from urllib.parse import unquote, urlparse
+    uri = urlparse(os.getenv("AIDA_DB_URI", "postgresql://aida:aida_password@localhost:55432/aida_kb"))
+    return {"host": uri.hostname or "localhost", "port": uri.port or 5432, "user": unquote(uri.username or "aida"),
+            "password": unquote(uri.password or ""), "db": (uri.path or "/aida_kb").lstrip("/") or "aida_kb"}
+
+
+def _backup_dir() -> str:
+    return os.getenv("AIDA_BACKUP_DIR") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "backups")
+
+
+def _find_db_container(port: int) -> str | None:
+    configured = os.getenv("AIDA_DB_CONTAINER", "").strip()
+    if configured:
+        return configured if re.match(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$", configured) else None
+    ok, output = _run_status(["docker", "ps", "--filter", f"publish={port}", "--format", "{{.Names}}"], timeout=20)
+    names = [n.strip() for n in output.splitlines() if n.strip()] if ok else []
+    return names[0] if names else None
+
+
+def _dump_with_pg_dump(db: dict, target: str) -> tuple[bool, str]:
+    if not shutil.which("pg_dump"):
+        return False, "pg_dump is not installed on this machine"
+    try:
+        result = subprocess.run(
+            ["pg_dump", "-h", db["host"], "-p", str(db["port"]), "-U", db["user"], "-d", db["db"], "-Fc", "-f", target],
+            capture_output=True, text=True, timeout=600, env={**os.environ, "PGPASSWORD": db["password"]},
+        )
+    except subprocess.TimeoutExpired:
+        return False, "pg_dump timed out"
+    return result.returncode == 0, (result.stderr or "").strip()[:300]
+
+
+def _dump_with_docker(db: dict, target: str) -> tuple[bool, str]:
+    container = _find_db_container(db["port"])
+    if not container:
+        return False, f"no running Docker container publishes port {db['port']} (set AIDA_DB_CONTAINER)"
+    try:
+        with open(target, "wb") as out:
+            result = subprocess.run(["docker", "exec", container, "pg_dump", "-U", db["user"], "-d", db["db"], "-Fc"],
+                                    stdout=out, stderr=subprocess.PIPE, timeout=600)
+    except FileNotFoundError:
+        return False, "docker is not installed"
+    except subprocess.TimeoutExpired:
+        return False, "docker exec pg_dump timed out"
+    return result.returncode == 0, (result.stderr or b"").decode(errors="replace").strip()[:300] or f"container {container}"
+
+
+@mcp.tool()
+def backup_database(keep: int = 14) -> str:
+    """
+    Backs up AIDA's own database (tickets, audit log, users, knowledge base) to a file in AIDA's backups
+    folder, checks the file is a valid backup, and keeps only the newest `keep` backups. Runs after approval
+    or as a pre-approved schedule.
+    """
+    keep = max(1, min(int(keep), 365))
+    db = _db_settings()
+    folder = _backup_dir()
+    try:
+        os.makedirs(folder, exist_ok=True)
+    except OSError as e:
+        return f"FAILED: cannot create the backup folder {folder}: {e}"
+    name = f"{db['db']}_{time.strftime('%Y-%m-%d_%H%M%S')}.dump"
+    final_path = os.path.join(folder, name)
+    partial = final_path + ".partial"
+    attempts = []
+    for method, dump in (("pg_dump", _dump_with_pg_dump), ("docker", _dump_with_docker)):
+        ok, detail = dump(db, partial)
+        valid = ok and os.path.exists(partial) and os.path.getsize(partial) > 0
+        if valid:
+            with open(partial, "rb") as f:
+                valid = f.read(5) == b"PGDMP"
+        if valid:
+            os.replace(partial, final_path)
+            break
+        attempts.append(f"{method}: {detail or 'produced no valid backup'}")
+        if os.path.exists(partial):
+            os.remove(partial)
+    else:
+        return "FAILED: the database was not backed up. " + "; ".join(attempts)
+
+    backups = sorted(f for f in os.listdir(folder) if re.match(rf"^{re.escape(db['db'])}_[0-9_-]+\.dump$", f))
+    removed = backups[:-keep] if len(backups) > keep else []
+    for old in removed:
+        os.remove(os.path.join(folder, old))
+    size_kb = os.path.getsize(final_path) / 1024
+    return (f"SUCCESS: backed up the {db['db']} database to {final_path} ({size_kb:,.0f} KB, using {method}); "
+            f"keeping the newest {min(len(backups), keep)} backup(s)" + (f", removed {len(removed)} older." if removed else ".")
+            + f" Restore with: pg_restore --clean -d {db['db']} {name}")
+
+
+# ---------------------------------------------------------------------------
+# Used by AIDA itself when this file runs on ANOTHER machine (monitoring over SSH)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def monitor_snapshot() -> str:
+    """For AIDA's own monitoring of this machine from another computer; not a troubleshooting tool."""
+    from dataclasses import asdict
+    from src import monitor as _monitor
+    alerts = _monitor.collect_alerts()
+    return json.dumps({"host": socket.gethostname(), "alerts": [asdict(a) for a in alerts],
+                       "windows": _monitor.windows_status})
+
+
+# ---------------------------------------------------------------------------
 # Windows (the same PC, reached from WSL through Windows PowerShell)
 # ---------------------------------------------------------------------------
 
@@ -1194,6 +1303,10 @@ RUNBOOKS: dict[str, dict] = {
         "description": "Install pending security updates, then re-run the security health check.",
         "steps": [("install_security_updates", {}), ("security_audit", {})],
     },
+    "database_backup": {
+        "description": "Back up AIDA's own database (tickets, audit log, users, knowledge base) and keep the newest 14 backups.",
+        "steps": [("backup_database", {"keep": 14})],
+    },
     "windows_cleanup": {
         "description": "Free space on Windows: delete the Windows user's old temp files, then re-check Windows health.",
         "steps": [("windows_clear_temp", {"older_than_days": 7}), ("windows_health", {})],
@@ -1388,4 +1501,6 @@ def compliance_check(output_format: str = "text") -> str:
 
 
 if __name__ == "__main__":
+    # src.monitor imports this module by name; reuse this copy instead of loading a second one
+    sys.modules.setdefault("mcp_server", sys.modules[__name__])
     mcp.run()

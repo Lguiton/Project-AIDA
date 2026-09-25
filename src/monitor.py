@@ -38,6 +38,7 @@ class Alert:
     key: str
     check: str
     issue: str
+    machine: str | None = None  # None = this computer; otherwise a machine id from src/machines.py
 
 
 def _env_float(name: str, default: float) -> float:
@@ -185,16 +186,23 @@ def check_windows(snapshot=None) -> list[Alert]:
     from src import windows
     if snapshot is None:
         if not windows.monitoring_enabled():
+            windows_status.update({"enabled": False, "ok": None, "error": None, "computer": None, "problems": 0,
+                                   "checked_at": datetime.now(timezone.utc).isoformat()})
             return []
         snapshot = windows.snapshot
     try:
         snap = snapshot()
     except Exception as e:
         print(f"[Monitor] Windows check skipped: {e}")
+        windows_status.update({"enabled": True, "ok": False, "error": str(e)[:300], "computer": None, "problems": 0,
+                               "checked_at": datetime.now(timezone.utc).isoformat()})
         return []
+    found = windows.problems(snap, _env_float("AIDA_MONITOR_DISK_PCT", 90), _env_float("AIDA_MONITOR_MEM_PCT", 10))
+    windows_status.update({"enabled": True, "ok": True, "error": None, "computer": snap.get("computer"),
+                           "problems": len(found), "checked_at": datetime.now(timezone.utc).isoformat()})
     return [
         Alert(key=key, check=check, issue=f"{AUTO_PREFIX} [Windows] {text}")
-        for key, check, text in windows.problems(snap, _env_float("AIDA_MONITOR_DISK_PCT", 90), _env_float("AIDA_MONITOR_MEM_PCT", 10))
+        for key, check, text in found
     ]
 
 
@@ -212,6 +220,9 @@ def collect_alerts() -> list[Alert]:
 # ---------------------------------------------------------------------------
 # Running the checks and opening tickets
 # ---------------------------------------------------------------------------
+
+# Result of the last Windows check, so the dashboard can tell "healthy" from "could not check"
+windows_status: dict = {"enabled": None, "ok": None, "error": None, "computer": None, "problems": 0, "checked_at": None}
 
 last_run: dict = {"checked_at": None, "alerts": [], "opened": [], "suppressed": [], "error": None}
 

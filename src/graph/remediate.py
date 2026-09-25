@@ -27,7 +27,7 @@ async def remediate_specialist_node(state: AidaState, llm, tools) -> dict:
         "block_ip / unblock_ip (firewall one IP address, e.g. one that is guessing passwords), "
         "install_security_updates, and run_runbook (several steps under one approval; prefer a runbook when the "
         "request matches one, e.g. 'free up disk space' -> disk_cleanup, 'fix DNS/internet' -> network_reset, "
-        "'patch this machine' -> security_patch). "
+        "'patch this machine' -> security_patch, 'back up AIDA's database' -> database_backup). "
         "For WINDOWS (AIDA runs in WSL on a Windows PC): windows_restart_service (allowlisted Windows service by service "
         "name, e.g. 'Spooler' for the print spooler), windows_defender_scan (Defender quick scan), windows_update_signatures "
         "(update Defender virus definitions), windows_clear_temp (the Windows user's old temp files), and the runbooks "

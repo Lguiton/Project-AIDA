@@ -117,9 +117,9 @@ def fetch_metrics():
         return None
 
 
-def submit_ticket(issue_text):
+def submit_ticket(issue_text, machine="local"):
     try:
-        response = requests.post(API_URL, json={"issue": issue_text}, headers=auth_headers(), timeout=300)
+        response = requests.post(API_URL, json={"issue": issue_text, "machine": machine}, headers=auth_headers(), timeout=300)
         if response.status_code == 200:
             return True
         st.error(f"Backend returned {response.status_code}: {response.text}")
@@ -187,6 +187,8 @@ with st.sidebar:
             st.success("Security report added to the ticket queue.")
 
 RUNBOOKS = api_call("GET", "/runbooks", "Could not load runbooks") or {}
+MACHINES = api_call("GET", "/machines", "Could not load machines") or [{"id": "local", "name": "This computer", "enabled": True}]
+MACHINE_NAMES = {m["id"]: m["name"] for m in MACHINES}
 
 # --- UI Layout ---
 st.title("🛡️ Project AIDA Command Center")
@@ -214,11 +216,16 @@ with tickets_tab:
         st.subheader("Submit New Issue")
         with st.form("ticket_form", clear_on_submit=True):
             issue_input = st.text_area("Describe the IT problem:", height=100, placeholder="e.g., I'm getting a BSOD with SYSTEM_SERVICE_EXCEPTION...")
+            usable = [m for m in MACHINES if m["enabled"]]
+            target_machine = "local"
+            if len(usable) > 1:
+                target_machine = st.selectbox("Which computer?", [m["id"] for m in usable],
+                                              format_func=lambda mid: MACHINE_NAMES.get(mid, mid))
             submitted = st.form_submit_button("Deploy Agent")
 
             if submitted and issue_input:
                 with st.spinner("Cognitive Router analyzing..."):
-                    if submit_ticket(issue_input):
+                    if submit_ticket(issue_input, target_machine):
                         st.success("Ticket dispatched to specialist node.")
 
     with right_pane:
@@ -237,6 +244,8 @@ with tickets_tab:
                 is_open = ticket.get("status") not in ("resolved", "denied", "failed", "dismissed") or ticket.get("requires_approval")
                 origin = {"monitor": "🤖 Auto-detected · ", "schedule": "🗓️ Scheduled · ",
                           "product": f"🧩 {ticket.get('product_id') or 'Product'} error · "}.get(ticket.get("source"), "")
+                if ticket.get("machine") and ticket["machine"] != "local":
+                    origin = f"🖥️ {MACHINE_NAMES.get(ticket['machine'], ticket['machine'])} · " + origin
                 with st.expander(f"{origin}Ticket {thread_id[:8]} - Specialist: {specialist} - {created}", expanded=bool(is_open)):
                     st.markdown(f"**Issue:** {ticket.get('issue')}")
                     st.markdown(f"**Status:** `{ticket.get('status')}`")
@@ -296,10 +305,25 @@ if audit_tab is not None:
                     st.caption(f"Checks run every {status['interval_seconds'] / 60:.0f} minute(s) and open tickets for new problems.")
                 else:
                     st.caption("Scheduled checks are off (AIDA_MONITOR_INTERVAL=0). Use 'Run health checks now'.")
-                if status.get("windows"):
-                    st.caption("🪟 Also checking Windows on this PC: drives, memory, key services, Defender and firewall.")
-                else:
+                win = status.get("windows_status") or {}
+                if not status.get("windows"):
                     st.caption("🪟 Windows checks are off (Windows is not reachable from AIDA, or AIDA_MONITOR_WINDOWS=off).")
+                elif win.get("ok") is False:
+                    st.error(f"🪟 The Windows check could not run ({format_timestamp(win.get('checked_at'))}): {win.get('error')}")
+                elif win.get("ok"):
+                    found = win.get("problems") or 0
+                    st.caption(f"🪟 Windows ({win.get('computer') or 'this PC'}) checked {format_timestamp(win.get('checked_at'))}: "
+                               + ("no problems." if not found else f"{found} problem(s), listed below."))
+                else:
+                    st.caption("🪟 Windows will be checked on the next run: drives, memory, key services, Defender and firewall.")
+                for m in status.get("machines") or []:
+                    if m.get("ok") is False:
+                        st.error(f"🖥️ {m['name']}: could not be checked ({format_timestamp(m.get('checked_at'))}). {m.get('error')}")
+                    elif m.get("ok"):
+                        st.caption(f"🖥️ {m['name']} checked {format_timestamp(m.get('checked_at'))}: "
+                                   + (f"{m['alerts']} problem(s)." if m.get("alerts") else "no problems."))
+                    else:
+                        st.caption(f"🖥️ {m['name']}: not checked yet.")
                 if status.get("checked_at"):
                     st.write(f"Last run: {format_timestamp(status['checked_at'])}")
                     if status.get("error"):
@@ -378,6 +402,46 @@ if admin_tab is not None:
             if st.button("I've copied it"):
                 st.session_state.pop("new_product_secret", None)
                 st.rerun()
+        st.divider()
+        st.subheader("Machines")
+        st.caption("Other computers AIDA looks after over SSH. First run `scripts/install_agent.sh user@host` from the "
+                   "project-aida folder (it needs SSH key login to that machine), then add it here and test it.")
+        for m in [m for m in MACHINES if m["id"] != "local"]:
+            with st.container(border=True):
+                st.markdown(f"**{m['name']}** (`{m['id']}`) — {'✅ enabled' if m['enabled'] else '⏸️ disabled'} · "
+                            f"`{m.get('ssh_target')}` port {m.get('ssh_port')}")
+                st.caption(f"Remote command: `{m.get('remote_command')}`")
+                m1, m2, _ = st.columns([1, 1, 3])
+                if m1.button("Test connection", key=f"test_{m['id']}"):
+                    with st.spinner(f"Connecting to {m['name']}..."):
+                        tested = api_call("POST", f"/machines/{m['id']}/test", "Test failed", timeout=120)
+                    if tested and tested["ok"]:
+                        st.success(f"Connected: {tested['tools']} tools available.")
+                        st.code(tested.get("system_info") or "", language="text")
+                        if tested.get("missing_tools"):
+                            st.warning("Its agent is older than this AIDA (missing: " + ", ".join(tested["missing_tools"])
+                                       + "). Run scripts/install_agent.sh again to update it.")
+                    elif tested:
+                        st.error(tested["error"])
+                if m2.button("Disable" if m["enabled"] else "Enable", key=f"toggle_machine_{m['id']}"):
+                    api_call("POST", f"/machines/{m['id']}", "Update failed", json={"enabled": not m["enabled"]})
+                    st.rerun()
+        with st.form("add_machine", clear_on_submit=True):
+            st.markdown("**Add a machine**")
+            mc1, mc2 = st.columns(2)
+            new_mid = mc1.text_input("Machine id", placeholder="office-laptop")
+            new_mname = mc2.text_input("Name", placeholder="Office laptop")
+            mc3, mc4 = st.columns([3, 1])
+            new_target = mc3.text_input("SSH target", placeholder="guito@192.168.1.50")
+            new_port = mc4.number_input("SSH port", min_value=1, max_value=65535, value=22)
+            new_cmd = st.text_input("Remote command", value="aida-agent/venv/bin/python aida-agent/mcp_server.py")
+            if st.form_submit_button("Add machine") and new_mid and new_target:
+                if api_call("POST", "/machines", "Could not add machine", json={
+                    "id": new_mid, "name": new_mname or new_mid, "ssh_target": new_target,
+                    "ssh_port": int(new_port), "remote_command": new_cmd,
+                }) is not None:
+                    st.success(f"Added {new_mname or new_mid}. Click 'Test connection' to check it.")
+                    st.rerun()
         st.divider()
         users_col, notify_col = st.columns([1.3, 1])
         with users_col:

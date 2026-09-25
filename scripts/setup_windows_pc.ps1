@@ -35,7 +35,7 @@ $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $isElevated = ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isElevated) { Stop-With "Open PowerShell with 'Run as administrator' and run this script again." }
 $userName = $env:USERNAME
-if ($userName -match '\s') { Write-Host "   Note: this Windows user name contains a space; AIDA needs a user name without spaces." -ForegroundColor Yellow }
+if ($userName -match '\s') { Write-Host "   Note: this Windows user name contains a space; use quotes around it on the AIDA side, e.g. ""$userName@<address>""." -ForegroundColor Yellow }
 
 # ---- 1. WSL -----------------------------------------------------------------------------
 Step "Checking WSL (Ubuntu)"
@@ -108,7 +108,7 @@ Write-Host "`nThis PC is ready." -ForegroundColor Green
 Write-Host "  Windows user:  $userName"
 Write-Host "  Address(es):   $($addresses -join ', ')"
 Write-Host "`nOn the computer that runs AIDA (in Ubuntu), test the login once:"
-Write-Host "  ssh -i ~/.ssh/aida_ed25519 $userName@$($addresses | Select-Object -First 1)"
+Write-Host "  ssh -i ~/.ssh/aida_ed25519 ""$userName@$($addresses | Select-Object -First 1)"""
 Write-Host "Then install AIDA's helper:"
-Write-Host "  bash scripts/install_agent.sh $userName@$($addresses | Select-Object -First 1)"
+Write-Host "  bash scripts/install_agent.sh ""$userName@$($addresses | Select-Object -First 1)"""
 Write-Host "`nKeep this PC from sleeping while you want it monitored (Settings > System > Power)."

@@ -35,6 +35,14 @@ python -m src.kb.setup      # seed the knowledge base (first time)
 
 ## Run
 
+Easiest: one command starts Docker (if needed), the database, the API and the dashboard, in order, and waits until each is ready:
+
+```bash
+./start_aida.sh        # then open http://localhost:8501; Ctrl+C in that window stops AIDA
+```
+
+Logs go to `logs/api.log` and `logs/dashboard.log`. Or start the parts by hand:
+
 ```bash
 uvicorn main:app --port 8006     # terminal 1
 streamlit run app.py             # terminal 2, then open http://localhost:8501

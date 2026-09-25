@@ -30,7 +30,9 @@ current_machine: contextvars.ContextVar[str] = contextvars.ContextVar("aida_mach
 
 DEFAULT_REMOTE_COMMAND = "~/aida-agent/venv/bin/python ~/aida-agent/mcp_server.py"
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
-_TARGET = re.compile(r"^(?:[A-Za-z0-9._][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
+# user@host. Windows user names may contain spaces ("house strtp"): allowed inside the user part, which is
+# always passed to ssh as ONE argument (never through a shell), so a space cannot split it.
+_TARGET = re.compile(r"^(?:[A-Za-z0-9._](?:[A-Za-z0-9._ -]{0,62}[A-Za-z0-9._-])?@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_./~][A-Za-z0-9_./~=,:+-]{0,255}$")
 
 MACHINES_SCHEMA_SQL = (
@@ -55,7 +57,7 @@ def validate(machine_id: str | None = None, ssh_target: str | None = None, ssh_p
     if machine_id is not None and (machine_id == LOCAL or not _ID.match(machine_id)):
         return "Machine id: lowercase letters, digits and dashes (e.g. 'office-laptop'); 'local' is reserved."
     if ssh_target is not None and not _TARGET.match(ssh_target):
-        return "SSH target must look like user@host or host (letters, digits, dots, dashes)."
+        return "SSH target must look like user@host or host (letters, digits, dots, dashes; spaces only inside the user name)."
     if ssh_port is not None and not (1 <= int(ssh_port) <= 65535):
         return "SSH port must be between 1 and 65535."
     if remote_command is not None:

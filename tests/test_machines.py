@@ -202,3 +202,12 @@ def test_aida_uses_its_own_ssh_key_when_present(tmp_path, monkeypatch):
     assert args[args.index("-i") + 1] == str(key) and "IdentitiesOnly=yes" in args
     assert args.index("-i") < args.index("--")  # options always before the target
     assert machines.validate(remote_command=machines.DEFAULT_REMOTE_COMMAND) is None
+
+
+def test_windows_user_names_with_spaces_are_allowed_safely():
+    assert machines.validate(ssh_target="house strtp@192.168.1.50") is None
+    assert machines.validate(ssh_target=" house@192.168.1.50") is not None      # no leading space
+    assert machines.validate(ssh_target="house strtp @192.168.1.50") is not None  # no trailing space
+    assert machines.validate(ssh_target="house;rm -rf ~@192.168.1.50") is not None
+    args = machines.ssh_args({"ssh_port": 22, "ssh_target": "house strtp@192.168.1.50", "remote_command": "python3 a.py"})
+    assert "house strtp@192.168.1.50" in args  # one argument, never split

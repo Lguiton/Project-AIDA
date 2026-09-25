@@ -811,7 +811,9 @@ async def product_health_alerts() -> list:
     for product in await products.list_products(db_pool):
         if product["paused"] or not product["health_url"]:
             continue
-        problem = await asyncio.to_thread(products.check_health, product["health_url"])
+        result = await asyncio.to_thread(products.probe_health, product["health_url"])
+        await products.record_health(db_pool, product["id"], result)
+        problem = result["detail"] if result["state"] == "down" else None
         if problem:
             alerts.append(monitor.Alert(
                 key=f"health:{product['id']}", check="product_health",
@@ -876,12 +878,20 @@ class NewProduct(BaseModel):
     name: str
     environment: str = "local"
     health_url: str | None = None
+    dashboard_url: str | None = None
 
 
 class ProductUpdate(BaseModel):
     paused: bool | None = None
     health_url: str | None = None
+    dashboard_url: str | None = None
     rotate_secret: bool = False
+
+
+def _check_urls(*urls):
+    for url in urls:
+        if url and not url.startswith(("http://", "https://")):
+            raise HTTPException(status_code=400, detail="URLs must start with http:// or https://.")
 
 
 @api.get("/products")
@@ -894,11 +904,11 @@ async def add_product(new: NewProduct, user: dict = admin):
     product_id = new.id.strip().lower()
     if not products.valid_slug(product_id):
         raise HTTPException(status_code=400, detail="Product id: lowercase letters, digits and dashes, e.g. eivanta-analytics.")
-    if new.health_url and not new.health_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Health URL must start with http:// or https://.")
+    _check_urls(new.health_url, new.dashboard_url)
     try:
         secret = await products.add_product(db_pool, product_id, new.name.strip()[:80] or product_id,
-                                            new.environment.strip()[:20] or "local", new.health_url, user["username"])
+                                            new.environment.strip()[:20] or "local", new.health_url, user["username"],
+                                            new.dashboard_url)
     except Exception:
         raise HTTPException(status_code=409, detail=f"Product '{product_id}' already exists.")
     await audit.record(db_pool, user["username"], "product.added", None,
@@ -907,13 +917,40 @@ async def add_product(new: NewProduct, user: dict = admin):
             "note": "Copy this secret into the product's .env as AIDA_INTAKE_SECRET now; it is not shown again."}
 
 
+@api.get("/products/overview")
+async def products_overview(user: dict = approver):
+    """One row per connected product: health now, uptime, open errors, open tickets."""
+    return await products.overview(db_pool)
+
+
+@api.get("/products/{product_id}/detail")
+async def product_detail(product_id: str, days: int = 30, user: dict = approver):
+    found = await products.detail(db_pool, product_id, max(1, min(days, products.HEALTH_KEEP_DAYS)))
+    if found is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    return found
+
+
+@api.post("/products/{product_id}/check")
+async def check_product_now(product_id: str, user: dict = approver):
+    """Run this product's health check now and record the result (no ticket is opened from here)."""
+    product = await products.get_product(db_pool, product_id)
+    if product is None:
+        raise HTTPException(status_code=404, detail="Product not found")
+    if not product["health_url"]:
+        raise HTTPException(status_code=400, detail="This product has no health URL.")
+    result = await asyncio.to_thread(products.probe_health, product["health_url"])
+    await products.record_health(db_pool, product_id, result)
+    return result
+
+
 @api.post("/products/{product_id}")
 async def change_product(product_id: str, change: ProductUpdate, user: dict = admin):
     if not await products.get_product(db_pool, product_id):
         raise HTTPException(status_code=404, detail="Product not found")
-    if change.health_url and not change.health_url.startswith(("http://", "https://")):
-        raise HTTPException(status_code=400, detail="Health URL must start with http:// or https://.")
-    secret = await products.update_product(db_pool, product_id, change.paused, change.health_url, change.rotate_secret)
+    _check_urls(change.health_url, change.dashboard_url)
+    secret = await products.update_product(db_pool, product_id, change.paused, change.health_url, change.rotate_secret,
+                                           change.dashboard_url)
     details = {k: v for k, v in change.model_dump().items() if v not in (None, False)}
     await audit.record(db_pool, user["username"], "product.updated", None, {"product": product_id, **details})
     return {"id": product_id, **details, **({"intake_secret": secret} if secret else {})}

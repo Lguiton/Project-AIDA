@@ -202,3 +202,57 @@ def test_unhealthy_product_opens_a_ticket(api_client, health_server, monkeypatch
     assert ticket["current_specialist"] == "app_errors" and ticket["source"] == "monitor"
     assert "database unreachable" in ticket["issue"]
     assert not any(a["key"] == "health:eivanta-analytics" for a in paused_run["alerts"])
+
+
+
+# ---- Products tab: health history, overview, detail --------------------------------------
+
+def test_probe_reports_state_version_and_maintenance(health_server):
+    state, url = health_server
+    state["body"] = {"overall_status": "operational", "version": "3.11.2"}
+    up = products.probe_health(url)
+    assert up["state"] == "up" and up["version"] == "3.11.2" and up["response_ms"] >= 0
+    state["body"] = {"overall_status": "maintenance", "maintenance": {"active": True, "reason": "DB upgrade"}}
+    assert products.probe_health(url) | {"response_ms": 0} == {
+        "state": "maintenance", "detail": "in declared maintenance: DB upgrade", "response_ms": 0, "version": None}
+    state["status"] = 500
+    assert products.probe_health(url)["state"] == "down"
+
+
+def test_overview_and_detail_show_health_history_and_errors(api_client, health_server, monkeypatch):
+    state, url = health_server
+    monkeypatch.setattr(monitor, "collect_alerts", lambda: [])
+    with api_client() as client:
+        secret = add_eivanta(client)
+        import psycopg
+        from tests.conftest import TEST_DB_URI
+        with psycopg.connect(TEST_DB_URI, autocommit=True) as conn:  # earlier tests' checks would skew uptime
+            conn.execute("DELETE FROM aida_product_health WHERE product_id = 'eivanta-analytics'")
+        approver = make_user(client, "products-approver", "approver")
+        requester = make_user(client, "products-requester", "requester")
+        assert client.post("/api/products/eivanta-analytics", json={"dashboard_url": "javascript:alert(1)"}).status_code == 400
+        client.post("/api/products/eivanta-analytics", json={"health_url": url, "dashboard_url": "http://localhost:3000"})
+        client.post("/api/products/eivanta-analytics", json={"paused": False})
+
+        state["status"], state["body"] = 200, {"overall_status": "operational", "version": "3.11"}
+        client.post("/api/monitor/run")                                    # recorded: up
+        state["status"] = 503
+        now = client.post("/api/products/eivanta-analytics/check", headers=approver).json()  # recorded: down
+        assert now["state"] == "down" and "503" in now["detail"]
+        post_report(client, secret, sample_report(signature="ovw1"))
+        time.sleep(0.5)  # the error ticket opens in the background
+
+        assert client.get("/api/products/overview", headers=requester).status_code == 403
+        rows = {r["id"]: r for r in client.get("/api/products/overview", headers=approver).json()}
+        row = rows["eivanta-analytics"]
+        assert row["state"] == "down" and float(row["uptime_24h"]) == 50.0
+        assert row["dashboard_url"] == "http://localhost:3000" and row["open_errors"] >= 1
+
+        info = client.get("/api/products/eivanta-analytics/detail", headers=approver).json()
+        assert info["product"]["dashboard_url"] == "http://localhost:3000"
+        assert info["daily_uptime"][-1]["checks"] == 2 and float(info["daily_uptime"][-1]["uptime"]) == 50.0
+        assert [c["state"] for c in info["recent_checks"][:2]] == ["down", "up"]
+        assert info["recent_checks"][1]["version"] == "3.11"
+        mine = [e for e in info["errors"] if e["alert_key"].endswith(":ovw1")]
+        assert mine and mine[0]["error_type"] == "KeyError" and mine[0]["open"]
+        assert client.get("/api/products/nope/detail").status_code == 404

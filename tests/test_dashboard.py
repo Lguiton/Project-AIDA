@@ -72,7 +72,8 @@ def test_wrong_password_is_rejected(live_api):
 def test_admin_sees_every_tab(live_api):
     at = sign_in("admin", "test-password")
     assert not at.exception
-    assert [t.label for t in at.tabs] == ["Tickets", "Monitoring & Audit", "Reports", "Users & Notifications", "Maintenance"]
+    assert [t.label for t in at.tabs] == ["Tickets", "Products", "Monitoring & Audit", "Reports",
+                                          "Users & Notifications", "Maintenance"]
     assert any("Signed in as **admin** (admin)" in m.value for m in at.sidebar.markdown)
 
 
@@ -88,3 +89,22 @@ def test_requester_sees_only_tickets_and_cannot_approve(live_api):
     assert not any(b.label == "Approve" for b in at.button)
     assert any("Waiting for an approver" in c.value for c in at.caption)
     assert not any(b.label == "Run health checks now" for b in at.button)
+
+
+def test_products_tab_and_sidebar_show_a_connected_product(live_api):
+    import requests
+    headers = {"X-AIDA-Key": "test-api-key"}
+    created = requests.post(f"{live_api}/products", headers=headers, json={
+        "id": "dash-product", "name": "Dash Product", "health_url": f"{live_api.rsplit('/api', 1)[0]}/",
+        "dashboard_url": "http://localhost:3000"})
+    assert created.status_code in (200, 409), created.text
+    requests.post(f"{live_api}/products/dash-product/check", headers=headers)  # AIDA's own "/" answers 200: up
+    at = sign_in("admin", "test-password")
+    assert not at.exception
+    assert any("**Dash Product** · 🟢 Up" in m.value for m in at.sidebar.markdown)
+    assert any(b.label == "Details" for b in at.sidebar.button)
+    products_tab = next(t for t in at.tabs if t.label == "Products")
+    assert any("Dash Product" in m.value for m in products_tab.markdown)
+    assert any(b.label == "Check now" for b in products_tab.button)
+    # Paused afterwards: its health URL disappears with this test's server, and later tests run monitoring
+    requests.post(f"{live_api}/products/dash-product", headers=headers, json={"paused": True})

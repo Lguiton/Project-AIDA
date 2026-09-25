@@ -189,6 +189,37 @@ with st.sidebar:
 RUNBOOKS = api_call("GET", "/runbooks", "Could not load runbooks") or {}
 MACHINES = api_call("GET", "/machines", "Could not load machines") or [{"id": "local", "name": "This computer", "enabled": True}]
 MACHINE_NAMES = {m["id"]: m["name"] for m in MACHINES}
+PRODUCTS = (api_call("GET", "/products/overview", "Could not load products") or []) if CAN_APPROVE else []
+
+STATE_LABELS = {"up": "🟢 Up", "maintenance": "🔵 Maintenance", "down": "🔴 Down"}
+
+
+def product_state(p) -> str:
+    """Icon plus word, so the status never depends on color alone."""
+    if p.get("paused"):
+        return "⏸️ Paused"
+    if not p.get("health_url"):
+        return "⚪ No health check"
+    return STATE_LABELS.get(p.get("state"), "⚪ Not checked yet")
+
+
+def pct(value) -> str:
+    return "—" if value is None else f"{float(value):g}%"
+
+
+# Products in the sidebar: status at a glance, one click to the product itself or to its page here
+if PRODUCTS:
+    with st.sidebar:
+        st.divider()
+        st.subheader("Products")
+        for prod in PRODUCTS:
+            st.markdown(f"**{prod['name']}** · {product_state(prod)}"
+                        + (f" · {prod['open_errors']} open error(s)" if prod.get("open_errors") else ""))
+            s1, s2 = st.columns(2)
+            if s1.button("Details", key=f"side_{prod['id']}", help="Show it in the Products tab"):
+                st.session_state.selected_product = prod["id"]
+            if prod.get("dashboard_url"):
+                s2.link_button("Open ↗", prod["dashboard_url"], help=f"Open {prod['name']} in a new browser tab")
 
 # --- UI Layout ---
 st.title("🛡️ Project AIDA Command Center")
@@ -199,12 +230,13 @@ kpi_area = st.container()
 
 st.divider()
 
-tab_names = (["Tickets"] + (["Monitoring & Audit", "Reports"] if CAN_APPROVE else [])
+tab_names = (["Tickets"] + (["Products", "Monitoring & Audit", "Reports"] if CAN_APPROVE else [])
              + (["Users & Notifications", "Maintenance"] if IS_ADMIN else []))
 tabs = dict(zip(tab_names, st.tabs(tab_names)))
 tickets_tab = tabs["Tickets"]
 audit_tab = tabs.get("Monitoring & Audit")
 reports_tab = tabs.get("Reports")
+products_tab = tabs.get("Products")
 admin_tab = tabs.get("Users & Notifications")
 maintenance_tab = tabs.get("Maintenance")
 
@@ -293,6 +325,103 @@ with tickets_tab:
                             decide_ticket(thread_id, approved=False)
                             time.sleep(1)
                             st.rerun()
+
+if products_tab is not None:
+    with products_tab:
+        st.subheader("All products")
+        if not PRODUCTS:
+            st.info("No products connected yet. Connect one under Users & Notifications > Connected products."
+                    if IS_ADMIN else "No products connected yet.")
+        else:
+            st.dataframe(
+                [{"Product": p["name"], "Status": product_state(p), "Uptime 24h": pct(p.get("uptime_24h")),
+                  "Uptime 30 days": pct(p.get("uptime_30d")), "Open errors": p.get("open_errors") or 0,
+                  "Open tickets": p.get("open_tickets") or 0,
+                  "Response": f"{p['response_ms']} ms" if p.get("response_ms") is not None else "—",
+                  "Version": p.get("version") or "not reported",
+                  "Last check": format_timestamp(p.get("checked_at")) or "—"} for p in PRODUCTS],
+                hide_index=True, width="stretch",
+            )
+            ids = [p["id"] for p in PRODUCTS]
+            chosen = st.session_state.get("selected_product")
+            product_id = st.selectbox("Product", ids, index=ids.index(chosen) if chosen in ids else 0,
+                                      format_func=lambda pid: next(p["name"] for p in PRODUCTS if p["id"] == pid))
+            st.session_state.selected_product = product_id
+            summary = next(p for p in PRODUCTS if p["id"] == product_id)
+            info = api_call("GET", f"/products/{product_id}/detail", "Could not load this product")
+            if info:
+                prod = info["product"]
+                st.markdown(f"### {prod['name']}")
+                st.caption(f"`{prod['id']}` · {prod['environment']}"
+                           + (f" · health check: {prod['health_url']}" if prod.get("health_url") else ""))
+                m1, m2, m3, m4 = st.columns(4)
+                m1.metric("Status", product_state(summary))
+                m2.metric("Uptime, 30 days", pct(summary.get("uptime_30d")))
+                m3.metric("Open errors", summary.get("open_errors") or 0)
+                m4.metric("Response time", f"{summary['response_ms']} ms" if summary.get("response_ms") is not None else "—")
+                if summary.get("state") in ("down", "maintenance") and summary.get("detail"):
+                    (st.error if summary["state"] == "down" else st.info)(summary["detail"])
+
+                b1, b2, _ = st.columns([1, 1, 3])
+                if prod.get("dashboard_url"):
+                    b1.link_button(f"Open {prod['name']} ↗", prod["dashboard_url"])
+                if prod.get("health_url") and b2.button("Check now", key=f"check_{product_id}"):
+                    result = api_call("POST", f"/products/{product_id}/check", "Health check failed", timeout=30)
+                    if result:
+                        st.session_state.product_check = (product_id, result)
+                        st.rerun()
+                if st.session_state.get("product_check", (None,))[0] == product_id:
+                    result = st.session_state.pop("product_check")[1]
+                    st.success(f"{STATE_LABELS.get(result['state'], result['state'])} · {result.get('response_ms')} ms"
+                               + (f" · {result['detail']}" if result.get("detail") else ""))
+
+                st.markdown("**Uptime by day, last 30 days**")
+                daily = info.get("daily_uptime") or []
+                if daily:
+                    import altair as alt
+                    chart = alt.Chart(alt.Data(values=[{**d, "uptime": float(d["uptime"])} for d in daily])).mark_bar(
+                        cornerRadiusTopLeft=4, cornerRadiusTopRight=4).encode(
+                        x=alt.X("day:O", title=None, axis=alt.Axis(labelAngle=-45)),
+                        y=alt.Y("uptime:Q", title="Uptime (%)", scale=alt.Scale(domain=[0, 100])),
+                        tooltip=[alt.Tooltip("day:O", title="Day"), alt.Tooltip("uptime:Q", title="Uptime (%)"),
+                                 alt.Tooltip("checks:Q", title="Checks")],
+                    ).properties(height=220)
+                    st.altair_chart(chart, width="stretch")
+                else:
+                    st.caption("No health checks recorded yet. They are recorded on every monitoring run.")
+
+                st.markdown("**Errors reported by this product**")
+                errors = info.get("errors") or []
+                if errors:
+                    st.dataframe(
+                        [{"Error": f"{e.get('error_type') or 'Error'} on {e.get('method') or ''} {e.get('route') or ''}".strip(),
+                          "State": "open" if e["open"] else "closed", "Seen": e["occurrences"],
+                          "Customers affected": e["tenants"], "First seen": format_timestamp(e["first_seen"]),
+                          "Last seen": format_timestamp(e["last_seen"]),
+                          "Ticket": f"{(e.get('thread_id') or '')[:8]} ({e.get('status') or 'none'})"} for e in errors],
+                        hide_index=True, width="stretch",
+                    )
+                else:
+                    st.caption("No errors reported. 🎉")
+
+                with st.expander("Recent health checks"):
+                    st.dataframe(
+                        [{"When": format_timestamp(c["checked_at"]), "Result": STATE_LABELS.get(c["state"], c["state"]),
+                          "Response": f"{c['response_ms']} ms" if c.get("response_ms") is not None else "—",
+                          "Detail": c.get("detail") or ""} for c in info.get("recent_checks") or []],
+                        hide_index=True, width="stretch",
+                    )
+
+                if IS_ADMIN:
+                    with st.form(f"urls_{product_id}"):
+                        st.markdown("**Addresses**")
+                        new_dash = st.text_input("Dashboard URL (opens in a new tab)", value=prod.get("dashboard_url") or "",
+                                                 placeholder="http://localhost:3000")
+                        new_health_url = st.text_input("Health check URL", value=prod.get("health_url") or "")
+                        if st.form_submit_button("Save addresses"):
+                            if api_call("POST", f"/products/{product_id}", "Could not save", json={
+                                    "dashboard_url": new_dash.strip(), "health_url": new_health_url.strip()}) is not None:
+                                st.rerun()
 
 if audit_tab is not None:
     with audit_tab:
@@ -389,9 +518,11 @@ if admin_tab is not None:
             pc3, pc4 = st.columns([1, 2])
             new_env = pc3.selectbox("Environment", ["local", "staging", "production"])
             new_health = pc4.text_input("Health URL (optional)", value="http://127.0.0.1:8000/api/v1/status")
+            new_dashboard = st.text_input("Dashboard URL (optional, opens in a new tab)", placeholder="http://localhost:3000")
             if st.form_submit_button("Connect product"):
                 created = api_call("POST", "/products", "Could not connect product",
-                                   json={"id": new_pid, "name": new_pname, "environment": new_env, "health_url": new_health})
+                                   json={"id": new_pid, "name": new_pname, "environment": new_env, "health_url": new_health,
+                                         "dashboard_url": new_dashboard.strip() or None})
                 if created:
                     st.session_state.new_product_secret = (created["id"], created["intake_secret"])
         if st.session_state.get("new_product_secret"):

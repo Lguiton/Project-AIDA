@@ -73,7 +73,7 @@ def test_good_values_and_ssh_command_shape():
 
 def test_connection_errors_are_explained():
     assert "accept its host key" in machines.explain_failure(RuntimeError("Host key verification failed."))
-    assert "ssh-copy-id" in machines.explain_failure(RuntimeError("Permission denied (publickey)."))
+    assert "aida_ed25519.pub" in machines.explain_failure(RuntimeError("Permission denied (publickey)."))
     assert "is it on" in machines.explain_failure(RuntimeError("connect to host x port 22: Connection refused"))
 
 
@@ -189,3 +189,16 @@ def test_tools_refuse_unknown_machines():
         assert asyncio.run(wrapped.ainvoke({})).startswith("FAILED: machine 'nowhere' is not connected")
     finally:
         machines.current_machine.reset(token)
+
+
+def test_aida_uses_its_own_ssh_key_when_present(tmp_path, monkeypatch):
+    machine = {"ssh_port": 22, "ssh_target": "ops@pc", "remote_command": machines.DEFAULT_REMOTE_COMMAND}
+    monkeypatch.setenv("AIDA_SSH_KEY", str(tmp_path / "missing_key"))
+    assert "-i" not in machines.ssh_args(machine)  # no key yet: SSH's normal keys/agent
+    key = tmp_path / "aida_ed25519"
+    key.write_text("private key")
+    monkeypatch.setenv("AIDA_SSH_KEY", str(key))
+    args = machines.ssh_args(machine)
+    assert args[args.index("-i") + 1] == str(key) and "IdentitiesOnly=yes" in args
+    assert args.index("-i") < args.index("--")  # options always before the target
+    assert machines.validate(remote_command=machines.DEFAULT_REMOTE_COMMAND) is None

@@ -535,8 +535,9 @@ if admin_tab is not None:
                 st.rerun()
         st.divider()
         st.subheader("Machines")
-        st.caption("Other computers AIDA looks after over SSH. First run `scripts/install_agent.sh user@host` from the "
-                   "project-aida folder (it needs SSH key login to that machine), then add it here and test it.")
+        st.caption("Other computers AIDA looks after over SSH. First run `bash scripts/install_agent.sh user@host` from the "
+                   "project-aida folder (Windows PCs: run `scripts/setup_windows_pc.ps1` on that PC before), then add it "
+                   "here and test it.")
         for m in [m for m in MACHINES if m["id"] != "local"]:
             with st.container(border=True):
                 st.markdown(f"**{m['name']}** (`{m['id']}`) — {'✅ enabled' if m['enabled'] else '⏸️ disabled'} · "
@@ -565,7 +566,7 @@ if admin_tab is not None:
             mc3, mc4 = st.columns([3, 1])
             new_target = mc3.text_input("SSH target", placeholder="guito@192.168.1.50")
             new_port = mc4.number_input("SSH port", min_value=1, max_value=65535, value=22)
-            new_cmd = st.text_input("Remote command", value="aida-agent/venv/bin/python aida-agent/mcp_server.py")
+            new_cmd = st.text_input("Remote command", value="~/aida-agent/venv/bin/python ~/aida-agent/mcp_server.py")
             if st.form_submit_button("Add machine") and new_mid and new_target:
                 if api_call("POST", "/machines", "Could not add machine", json={
                     "id": new_mid, "name": new_mname or new_mid, "ssh_target": new_target,

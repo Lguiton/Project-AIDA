@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 LOCAL = "local"
 current_machine: contextvars.ContextVar[str] = contextvars.ContextVar("aida_machine", default=LOCAL)
 
-DEFAULT_REMOTE_COMMAND = "aida-agent/venv/bin/python aida-agent/mcp_server.py"
+DEFAULT_REMOTE_COMMAND = "~/aida-agent/venv/bin/python ~/aida-agent/mcp_server.py"
 _ID = re.compile(r"^[a-z0-9][a-z0-9-]{0,39}$")
 _TARGET = re.compile(r"^(?:[A-Za-z0-9._][A-Za-z0-9._-]{0,63}@)?[A-Za-z0-9][A-Za-z0-9.-]{0,252}$")
 _TOKEN = re.compile(r"^[A-Za-z0-9_./~][A-Za-z0-9_./~=,:+-]{0,255}$")
@@ -66,9 +66,18 @@ def validate(machine_id: str | None = None, ssh_target: str | None = None, ssh_p
     return None
 
 
+def aida_ssh_key() -> str | None:
+    """AIDA's own SSH key (no passphrase, so it can log in unattended): AIDA_SSH_KEY, or ~/.ssh/aida_ed25519.
+    Create it with: ssh-keygen -t ed25519 -f ~/.ssh/aida_ed25519 -N "" -C aida"""
+    path = os.path.expanduser(os.getenv("AIDA_SSH_KEY") or "~/.ssh/aida_ed25519")
+    return path if os.path.isfile(path) else None
+
+
 def ssh_args(machine: dict) -> list[str]:
+    key = aida_ssh_key()
     return [
         "-p", str(int(machine["ssh_port"])),
+        *(["-i", key, "-o", "IdentitiesOnly=yes"] if key else []),
         "-o", "BatchMode=yes",            # never prompt for a password or passphrase
         "-o", "ConnectTimeout=10",
         "-o", "ServerAliveInterval=15",
@@ -183,7 +192,8 @@ def explain_failure(error: BaseException) -> str:
     if "host key verification failed" in lowered:
         hint = "SSH does not trust this machine yet: connect once by hand with ssh and accept its host key."
     elif "permission denied" in lowered:
-        hint = "SSH refused the login: add this computer's SSH key to the machine (ssh-copy-id)."
+        hint = ("SSH refused the login: AIDA's key (~/.ssh/aida_ed25519.pub) is not authorized on that machine "
+                "(for a Windows PC, run scripts/setup_windows_pc.ps1 there).")
     elif "could not resolve" in lowered or "name or service not known" in lowered:
         hint = "The host name could not be found."
     elif "connection refused" in lowered or "timed out" in lowered or "no route" in lowered:
